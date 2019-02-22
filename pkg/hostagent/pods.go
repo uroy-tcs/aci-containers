@@ -265,6 +265,7 @@ func (agent *HostAgent) podChangedLocked(podobj interface{}) {
 		agent.epDeleted(&epUuid)
 		return
 	}
+	agent.cniToPodID[epMetaKey] = epUuid
 
 	epGroup := &metadata.OpflexGroup{}
 	if egval, ok := pod.ObjectMeta.Annotations[metadata.CompEgAnnotation]; ok {
@@ -389,8 +390,26 @@ func (agent *HostAgent) podDeletedLocked(obj interface{}) {
 	pod := obj.(*v1.Pod)
 	u := string(pod.ObjectMeta.UID)
 	if _, ok := agent.opflexEps[u]; ok {
+		agent.log.Infof("podDeleted: delete %s/%s", pod.ObjectMeta.Namespace, pod.ObjectMeta.Name)
 		delete(agent.opflexEps, u)
 		agent.scheduleSyncEps()
 	}
 	agent.epDeleted(&u)
+}
+
+func (agent *HostAgent) cniEpDelete(cniKey string) {
+	agent.indexMutex.Lock()
+	defer agent.indexMutex.Unlock()
+	epUuid, ok := agent.cniToPodID[cniKey]
+	if !ok {
+		agent.log.Warnf("cniEpDelete: PodID not found for %s", cniKey)
+		return
+	}
+	delete(agent.cniToPodID, cniKey)
+
+	if _, ok := agent.opflexEps[epUuid]; ok {
+		agent.log.Infof("cniEpDelete: delete %s", cniKey)
+		delete(agent.opflexEps, epUuid)
+		agent.scheduleSyncEps()
+	}
 }

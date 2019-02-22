@@ -40,6 +40,7 @@ type HostAgent struct {
 	opflexEps      map[string][]*opflexEndpoint
 	opflexServices map[string]*opflexService
 	epMetadata     map[string]map[string]*md.ContainerMetadata
+	cniToPodID     map[string]string
 	serviceEp      md.ServiceEndpoint
 
 	podInformer       cache.SharedIndexInformer
@@ -69,6 +70,7 @@ func NewHostAgent(config *HostAgentConfig, env Environment, log *logrus.Logger) 
 		opflexEps:      make(map[string][]*opflexEndpoint),
 		opflexServices: make(map[string]*opflexService),
 		epMetadata:     make(map[string]map[string]*md.ContainerMetadata),
+		cniToPodID:     make(map[string]string),
 
 		podIps: ipam.NewIpCache(),
 
