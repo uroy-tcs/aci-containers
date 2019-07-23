@@ -1,0 +1,4 @@
+FROM registry.redhat.io/ubi7/ubi-minimal
+RUN microdnf -y install openvswitch-switch openvswitch-common logrotate
+COPY docker/launch-ovs.sh docker/liveness-ovs.sh dist-static/ovsresync /usr/local/bin/
+CMD ["/usr/local/bin/launch-ovs.sh"]
