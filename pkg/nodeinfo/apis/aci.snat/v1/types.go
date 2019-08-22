@@ -7,7 +7,7 @@ import (
 // +genclient
 // +genclient:noStatus
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
+// +k8s:openapi-gen=true
 type NodeInfo struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -16,6 +16,7 @@ type NodeInfo struct {
 	Status NodeInfoStatus `json:"status,omitempty"`
 }
 
+// +k8s:openapi-gen=true
 type NodeInfoSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "operator-sdk generate k8s" to regenerate code after modifying this file
@@ -26,6 +27,7 @@ type NodeInfoSpec struct {
 }
 
 // NodeinfoStatus defines the observed state of Nodeinfo
+// +k8s:openapi-gen=true
 type NodeInfoStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "operator-sdk generate k8s" to regenerate code after modifying this file
