@@ -210,12 +210,18 @@ func (i *PodSelectorIndex) UpdatePodNoCallback(pod *v1.Pod) bool {
 	podUpdated := false
 	matched := make(set)
 	updatedObjs := make(set)
-
 	i.indexMutex.Lock()
 	// check each selector object that could apply to this pod's
 	// namespace for new matches
 	for objkey, v := range i.objNsIndex {
+		/*
+			it-ns/it-ns-nginx-deployment map[it-ns:[app=nginx]]"
+			"selectors:[app=nginx]"
+			"Pod  Keyit-ns/it-ns-nginx-deployment-576f754487-8qd8p"
+			"Object after podkey updated map[it-ns/it-ns-nginx-deployment-576f754487-8qd8p:true]"
+		*/
 		if selectors, ok := v[pod.ObjectMeta.Namespace]; ok {
+			i.log.Info("selectors:", selectors)
 			for _, podSelector := range selectors {
 				if podSelector.Matches(labels.Set(pod.ObjectMeta.Labels)) {
 					objm, ok := i.objPodIndex[objkey]
@@ -443,9 +449,7 @@ func (i *PodSelectorIndex) UpdateSelectorObjNoCallback(obj interface{}) bool {
 	i.indexMutex.Lock()
 	updatedPods, objUpdated := i.updateSelectorObjForNs(obj, namespaces)
 	i.indexMutex.Unlock()
-
 	i.updatePods(updatedPods)
-
 	return objUpdated
 }
 

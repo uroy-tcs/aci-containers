@@ -59,7 +59,7 @@ type opflexEndpoint struct {
 	IfaceName         string `json:"interface-name,omitempty"`
 
 	Attributes  map[string]string `json:"attributes,omitempty"`
-	SnatIp      string            `json:"snat-ip,omitempty"`
+	SnatUuid    []string          `json:"snat-uudid,omitempty"`
 	registryKey string            // TODO - export for persistence after verifying opflx can ignore it
 	registered  bool
 }
@@ -265,22 +265,17 @@ func (agent *HostAgent) syncEps() bool {
 				if ep.Uuid != epidstr {
 					continue
 				}
-				agent.indexMutex.Lock()
-				agent.log.Debug("snat local info", agent.opflexSnatLocalInfos)
-				for k, v := range agent.opflexSnatLocalInfos {
-					if k == poduuid {
-						if agent.opflexSnatLocalInfos[poduuid].MarkDelete == true {
+				v, ok := agent.opflexSnatLocalInfos[poduuid]
+				if ok {
+					/*
+						if v.MarkDelete == true {
 							delete(agent.opflexSnatLocalInfos, poduuid)
 							agent.log.Debug("Restting Snat IP in ep file")
-							ep.SnatIp = ""
-							break
-						}
-						ep.SnatIp = v.SnatIp
-						agent.log.Debug("Ep file updated with Snat IP", ep.SnatIp)
-						break
-					}
+							ep.SnatUuid = []string{}
+						}*/
+					ep.SnatUuid = v.PlcyUuids
+					agent.log.Debug("Ep file updated with Snat IP", ep.SnatUuid)
 				}
-				agent.indexMutex.Unlock()
 				wrote, err := writeEp(epfile, ep)
 				if err != nil {
 					opflexEpLogger(agent.log, ep).

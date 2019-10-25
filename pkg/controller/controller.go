@@ -25,8 +25,8 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
-	"golang.org/x/time/rate"
 	"github.com/yl2chen/cidranger"
+	"golang.org/x/time/rate"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -53,10 +53,11 @@ type AciController struct {
 	defaultEg string
 	defaultSg string
 
-	podQueue     workqueue.RateLimitingInterface
-	netPolQueue  workqueue.RateLimitingInterface
-	serviceQueue workqueue.RateLimitingInterface
-	snatQueue    workqueue.RateLimitingInterface
+	podQueue          workqueue.RateLimitingInterface
+	netPolQueue       workqueue.RateLimitingInterface
+	serviceQueue      workqueue.RateLimitingInterface
+	snatQueue         workqueue.RateLimitingInterface
+	snatNodeInfoQueue workqueue.RateLimitingInterface
 
 	namespaceIndexer      cache.Indexer
 	namespaceInformer     cache.Controller
@@ -76,6 +77,8 @@ type AciController struct {
 	networkPolicyInformer cache.Controller
 	snatIndexer           cache.Indexer
 	snatInformer          cache.Controller
+	snatNodeInfoIndexer   cache.Indexer
+	snatNodeInformer      cache.Controller
 
 	updatePod              podUpdateFunc
 	updateNode             nodeUpdateFunc
@@ -113,10 +116,12 @@ type AciController struct {
 	serviceMetaCache     map[string]*serviceMeta
 	snatPolicyCache      map[string]*ContSnatPolicy
 	snatServices         map[string]bool
-
-	nodeSyncEnabled    bool
-	serviceSyncEnabled bool
-	snatSyncEnabled    bool
+	snatNodeInfoCache    map[string]*ContSnatNodeInfo
+	// Node Name and Policy Name
+	snatGlobalInfoCache map[string]map[string]*ContSnatGlobalInfo
+	nodeSyncEnabled     bool
+	serviceSyncEnabled  bool
+	snatSyncEnabled     bool
 }
 
 type nodeServiceMeta struct {
@@ -152,8 +157,8 @@ type portIndexEntry struct {
 }
 
 type portRangeSnat struct {
-	start    int
-	end      int
+	start int
+	end   int
 }
 
 func (e *ipIndexEntry) Network() net.IPNet {
@@ -186,10 +191,11 @@ func NewController(config *ControllerConfig, env Environment, log *logrus.Logger
 		defaultEg: "",
 		defaultSg: "",
 
-		podQueue:     createQueue("pod"),
-		netPolQueue:  createQueue("networkPolicy"),
-		serviceQueue: createQueue("service"),
-		snatQueue:    createQueue("snat"),
+		podQueue:          createQueue("pod"),
+		netPolQueue:       createQueue("networkPolicy"),
+		serviceQueue:      createQueue("service"),
+		snatQueue:         createQueue("snat"),
+		snatNodeInfoQueue: createQueue("snatnodeinfo"),
 
 		configuredPodNetworkIps: newNetIps(),
 		podNetworkIps:           newNetIps(),
@@ -204,6 +210,8 @@ func NewController(config *ControllerConfig, env Environment, log *logrus.Logger
 		serviceMetaCache:     make(map[string]*serviceMeta),
 		snatPolicyCache:      make(map[string]*ContSnatPolicy),
 		snatServices:         make(map[string]bool),
+		snatNodeInfoCache:    make(map[string]*ContSnatNodeInfo),
+		snatGlobalInfoCache:  make(map[string]map[string]*ContSnatGlobalInfo),
 	}
 }
 
@@ -313,13 +321,13 @@ func (cont *AciController) Run(stopCh <-chan struct{}) {
 	}
 	cont.log.Info("ApicRefreshTimer conf is set to: ", refreshTimeout)
 
-        // Bailout if the refreshTimeout is more than 12Hours
-        if refreshTimeout > (12*60*60) {
-                cont.log.Info("ApicRefreshTimer can't be more than 12Hrs")
-                panic(err)
-        }
+	// Bailout if the refreshTimeout is more than 12Hours
+	if refreshTimeout > (12 * 60 * 60) {
+		cont.log.Info("ApicRefreshTimer can't be more than 12Hrs")
+		panic(err)
+	}
 
-	// If RefreshTickerAdjustInterval is not defined, default to 5Sec. 
+	// If RefreshTickerAdjustInterval is not defined, default to 5Sec.
 	if cont.config.ApicRefreshTickerAdjust == "" {
 		cont.config.ApicRefreshTickerAdjust = "5"
 	}
@@ -344,9 +352,9 @@ func (cont *AciController) Run(stopCh <-chan struct{}) {
 	if cont.config.SnatDefaultPortRangeEnd == 0 {
 		cont.config.SnatDefaultPortRangeEnd = defEnd
 	}
-	if (cont.config.SnatDefaultPortRangeStart < 0 || cont.config.SnatDefaultPortRangeEnd < 0 ||
+	if cont.config.SnatDefaultPortRangeStart < 0 || cont.config.SnatDefaultPortRangeEnd < 0 ||
 		cont.config.SnatDefaultPortRangeStart > defEnd || cont.config.SnatDefaultPortRangeEnd > defEnd ||
-			cont.config.SnatDefaultPortRangeStart > cont.config.SnatDefaultPortRangeEnd) {
+		cont.config.SnatDefaultPortRangeStart > cont.config.SnatDefaultPortRangeEnd {
 		cont.config.SnatDefaultPortRangeStart = defStart
 		cont.config.SnatDefaultPortRangeEnd = defEnd
 	}
@@ -399,6 +407,7 @@ func (cont *AciController) Run(stopCh <-chan struct{}) {
 		if ok {
 			qs = []workqueue.RateLimitingInterface{
 				cont.podQueue, cont.netPolQueue, cont.serviceQueue, cont.snatQueue,
+				cont.snatNodeInfoQueue,
 			}
 		}
 		for _, q := range qs {

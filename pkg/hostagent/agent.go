@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
-	"golang.org/x/time/rate"
+	"github.com/containernetworking/cni/pkg/types"
 	"github.com/vishvananda/netlink"
-        "github.com/containernetworking/cni/pkg/types"
+	"golang.org/x/time/rate"
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
@@ -35,6 +35,7 @@ import (
 	"github.com/noironetworks/aci-containers/pkg/index"
 	"github.com/noironetworks/aci-containers/pkg/ipam"
 	md "github.com/noironetworks/aci-containers/pkg/metadata"
+	snatpolicy "github.com/noironetworks/aci-containers/pkg/snatpolicy/apis/aci.snat/v1"
 )
 
 type HostAgent struct {
@@ -45,12 +46,11 @@ type HostAgent struct {
 	indexMutex sync.Mutex
 	ipamMutex  sync.Mutex
 
-	opflexEps      map[string][]*opflexEndpoint
-	opflexServices map[string]*opflexService
-	epMetadata     map[string]map[string]*md.ContainerMetadata
-	cniToPodID     map[string]string
-	serviceEp      md.ServiceEndpoint
-
+	opflexEps          map[string][]*opflexEndpoint
+	opflexServices     map[string]*opflexService
+	epMetadata         map[string]map[string]*md.ContainerMetadata
+	cniToPodID         map[string]string
+	serviceEp          md.ServiceEndpoint
 	crdClient          aciv1.AciV1Interface
 	podInformer        cache.SharedIndexInformer
 	endpointsInformer  cache.SharedIndexInformer
@@ -62,6 +62,7 @@ type HostAgent struct {
 	rcInformer         cache.SharedIndexInformer
 	snatLocalInformer  cache.SharedIndexInformer
 	snatGlobalInformer cache.SharedIndexInformer
+	snatPolicyInformer cache.SharedIndexInformer
 	netPolPods         *index.PodSelectorIndex
 	depPods            *index.PodSelectorIndex
 	rcPods             *index.PodSelectorIndex
@@ -75,11 +76,16 @@ type HostAgent struct {
 	syncProcessors      map[string]func() bool
 
 	ignoreOvsPorts        map[string][]string
-	opflexSnatLocalInfos  map[string]*OpflexSnatLocalInfo
-	opflexSnatGlobalInfos map[string][]*OpflexSnatGlobalInfo
 	netNsFuncChan         chan func()
 	vtepIP                string
 	vtepIface             string
+	opflexSnatGlobalInfos map[string][]*OpflexSnatGlobalInfo
+	opflexSnatLocalInfos  map[string]*OpflexSnatLocalInfo
+	//snatpods per snat policy
+	snatPods map[string]map[string]ResourceType
+	//Object Key and list of labels active for snatpolicy
+	snatPolicyLabels map[string][]string
+	snatPolicyCache  map[string]*snatpolicy.SnatPolicy
 }
 
 type Vtep struct {
@@ -102,8 +108,11 @@ func NewHostAgent(config *HostAgentConfig, env Environment, log *logrus.Logger) 
 		ignoreOvsPorts: make(map[string][]string),
 
 		netNsFuncChan:         make(chan func()),
-		opflexSnatLocalInfos:  make(map[string]*OpflexSnatLocalInfo),
 		opflexSnatGlobalInfos: make(map[string][]*OpflexSnatGlobalInfo),
+		opflexSnatLocalInfos:  make(map[string]*OpflexSnatLocalInfo),
+		snatPods:              make(map[string]map[string]ResourceType),
+		snatPolicyLabels:      make(map[string][]string),
+		snatPolicyCache:       make(map[string]*snatpolicy.SnatPolicy),
 		syncQueue: workqueue.NewNamedRateLimitingQueue(
 			&workqueue.BucketRateLimiter{
 				Limiter: rate.NewLimiter(rate.Limit(10), int(10)),
@@ -111,9 +120,10 @@ func NewHostAgent(config *HostAgentConfig, env Environment, log *logrus.Logger) 
 	}
 
 	ha.syncProcessors = map[string]func() bool{
-		"eps":      ha.syncEps,
-		"services": ha.syncServices,
-		"snat":     ha.syncSnat}
+		"eps":          ha.syncEps,
+		"services":     ha.syncServices,
+		"snat":         ha.syncSnat,
+		"snatnodeInfo": ha.syncSnatNodeInfo}
 
 	if ha.config.EPRegistry == "k8s" {
 		cfg, err := rest.InClusterConfig()
@@ -133,7 +143,7 @@ func NewHostAgent(config *HostAgentConfig, env Environment, log *logrus.Logger) 
 }
 
 func getVtep() (Vtep, error) {
-        var vtep Vtep
+	var vtep Vtep
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return vtep, err
@@ -172,15 +182,15 @@ func addPodRoute(ipn types.IPNet, dev string, src string) error {
 		return err
 	}
 	ipsrc := net.ParseIP(src)
-        dst := &net.IPNet{
-                        IP: ipn.IP,
-                        Mask: ipn.Mask,
-        }
+	dst := &net.IPNet{
+		IP:   ipn.IP,
+		Mask: ipn.Mask,
+	}
 	route := netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Src: ipsrc}
 	if err := netlink.RouteAdd(&route); err != nil {
 		return err
 	}
-        return nil
+	return nil
 }
 
 func (agent *HostAgent) Init() {
@@ -226,6 +236,10 @@ func (agent *HostAgent) scheduleSyncServices() {
 
 func (agent *HostAgent) scheduleSyncSnats() {
 	agent.ScheduleSync("snat")
+}
+
+func (agent *HostAgent) scheduleSyncNodeInfo() {
+	agent.ScheduleSync("snatnodeInfo")
 }
 
 func (agent *HostAgent) runTickers(stopCh <-chan struct{}) {
@@ -285,6 +299,7 @@ func (agent *HostAgent) EnableSync() (changed bool) {
 		agent.scheduleSyncServices()
 		agent.scheduleSyncEps()
 		agent.scheduleSyncSnats()
+		agent.scheduleSyncNodeInfo()
 	}
 	return
 }

@@ -244,7 +244,6 @@ func (agent *HostAgent) deploymentChanged(oldobj interface{},
 
 	olddep := oldobj.(*appsv1.Deployment)
 	newdep := newobj.(*appsv1.Deployment)
-
 	if !reflect.DeepEqual(olddep.Spec.Selector, newdep.Spec.Selector) {
 		agent.depPods.UpdateSelectorObj(newobj)
 	}

@@ -23,17 +23,25 @@ import (
 	snatglobal "github.com/noironetworks/aci-containers/pkg/snatglobalinfo/apis/aci.snat/v1"
 	snatglobalclset "github.com/noironetworks/aci-containers/pkg/snatglobalinfo/clientset/versioned"
 	snatlocal "github.com/noironetworks/aci-containers/pkg/snatlocalinfo/apis/aci.snat/v1"
-	snatlocalclset "github.com/noironetworks/aci-containers/pkg/snatlocalinfo/clientset/versioned"
+	snatpolicy "github.com/noironetworks/aci-containers/pkg/snatpolicy/apis/aci.snat/v1"
+	snatpolicyclset "github.com/noironetworks/aci-containers/pkg/snatpolicy/clientset/versioned"
+	"github.com/noironetworks/aci-containers/pkg/util"
 	"io/ioutil"
+	appsv1 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/kubernetes/pkg/controller"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 )
 
@@ -41,11 +49,22 @@ import (
 // example snat-external.service
 const SnatService = "snat-external"
 
+type ResourceType int
+
+const (
+	POD ResourceType = 1 << iota
+	SERVICE
+	DEPLOYMENT
+	NAMESPACE
+	CLUSTER
+)
+
 type OpflexPortRange struct {
 	Start int `json:"start,omitempty"`
 	End   int `json:"end,omitempty"`
 }
 
+// This structure is to write the  SnatFile
 type OpflexSnatIp struct {
 	Uuid          string                   `json:"uuid"`
 	InterfaceName string                   `json:"interface-name,omitempty"`
@@ -59,6 +78,7 @@ type OpflexSnatIp struct {
 	Zone          uint                     `json:"zone,omitempty"`
 	Remote        []OpflexSnatIpRemoteInfo `json:"remote,omitempty"`
 }
+
 type OpflexSnatIpRemoteInfo struct {
 	NodeIp     string            `json:"snat_ip,omitempty"`
 	MacAddress string            `json:"mac,omitempty"`
@@ -66,34 +86,19 @@ type OpflexSnatIpRemoteInfo struct {
 	Refcount   int               `json:"ref,omitempty"`
 }
 type OpflexSnatGlobalInfo struct {
-	SnatIp     string
-	MacAddress string
-	PortRange  []OpflexPortRange
-	SnatIpUid  string
-	Protocols  []string
+	SnatIp         string
+	MacAddress     string
+	PortRange      []OpflexPortRange
+	SnatIpUid      string
+	SnatPolicyName string
 }
 
 type OpflexSnatLocalInfo struct {
-	SnatIp     string
-	MarkDelete bool
+	Snatpolicies map[ResourceType][]string //Each resource can represent multiple entries
+	PlcyUuids    []string
+	MarkDelete   bool
 }
 
-func (agent *HostAgent) initSnatLocalInformerFromClient(
-	snatClient *snatlocalclset.Clientset) {
-	agent.initSnatLocalInformerBase(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				options.FieldSelector =
-					fields.Set{"metadata.name": agent.config.NodeName}.String()
-				return snatClient.AciV1().SnatLocalInfos(metav1.NamespaceAll).List(options)
-			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				options.FieldSelector =
-					fields.Set{"metadata.name": agent.config.NodeName}.String()
-				return snatClient.AciV1().SnatLocalInfos(metav1.NamespaceAll).Watch(options)
-			},
-		})
-}
 func (agent *HostAgent) initSnatGlobalInformerFromClient(
 	snatClient *snatglobalclset.Clientset) {
 	agent.initSnatGlobalInformerBase(
@@ -105,6 +110,14 @@ func (agent *HostAgent) initSnatGlobalInformerFromClient(
 				return snatClient.AciV1().SnatGlobalInfos(metav1.NamespaceAll).Watch(options)
 			},
 		})
+}
+
+func (agent *HostAgent) initSnatPolicyInformerFromClient(
+	snatClient *snatpolicyclset.Clientset) {
+	agent.initSnatPolicyInformerBase(
+		cache.NewListWatchFromClient(
+			snatClient.AciV1().RESTClient(), "snatpolicies",
+			metav1.NamespaceAll, fields.Everything()))
 }
 
 func getsnat(snatfile string) (string, error) {
@@ -162,27 +175,6 @@ func opflexSnatIpLogger(log *logrus.Logger, snatip *OpflexSnatIp) *logrus.Entry 
 	})
 }
 
-func (agent *HostAgent) initSnatLocalInformerBase(listWatch *cache.ListWatch) {
-	agent.snatLocalInformer = cache.NewSharedIndexInformer(
-		listWatch,
-		&snatlocal.SnatLocalInfo{},
-		controller.NoResyncPeriodFunc(),
-		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
-	)
-	agent.snatLocalInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			agent.snatLocalInfoUpdate(obj)
-		},
-		UpdateFunc: func(_ interface{}, obj interface{}) {
-			agent.snatLocalInfoUpdate(obj)
-		},
-		DeleteFunc: func(obj interface{}) {
-			agent.snatLocalInfoDelete(obj)
-		},
-	})
-	agent.log.Debug("Initializing Snat Local info Informers")
-}
-
 func (agent *HostAgent) initSnatGlobalInformerBase(listWatch *cache.ListWatch) {
 	agent.snatGlobalInformer = cache.NewSharedIndexInformer(
 		listWatch,
@@ -201,21 +193,249 @@ func (agent *HostAgent) initSnatGlobalInformerBase(listWatch *cache.ListWatch) {
 			agent.snatGlobalInfoDelete(obj)
 		},
 	})
-	agent.log.Debug("Initializing SnatGlobal Info Informers")
+	agent.log.Info("Initializing SnatGlobal Info Informers")
 }
 
-func (agent *HostAgent) snatLocalInfoUpdate(obj interface{}) {
+func (agent *HostAgent) initSnatPolicyInformerBase(listWatch *cache.ListWatch) {
+	agent.snatPolicyInformer = cache.NewSharedIndexInformer(
+		listWatch,
+		&snatpolicy.SnatPolicy{}, controller.NoResyncPeriodFunc(),
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+	)
+	agent.snatPolicyInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			agent.snatPolicyAdded(obj)
+		},
+		UpdateFunc: func(oldobj interface{}, newobj interface{}) {
+			agent.snatPolicyUpdated(oldobj, newobj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			agent.snatPolicyDeleted(obj)
+		},
+	})
+	agent.log.Info("Initializing Snat Policy Informers")
+}
+
+func (agent *HostAgent) snatPolicyAdded(obj interface{}) {
 	agent.indexMutex.Lock()
 	defer agent.indexMutex.Unlock()
-	snat := obj.(*snatlocal.SnatLocalInfo)
-	key, err := cache.MetaNamespaceKeyFunc(snat)
+	agent.log.Info("Policy Info Added: ")
+	policyinfo := obj.(*snatpolicy.SnatPolicy)
+	policyinfokey, err := cache.MetaNamespaceKeyFunc(policyinfo)
 	if err != nil {
-		SnatLocalInfoLogger(agent.log, snat).
-			Error("Could not create key:" + err.Error())
 		return
 	}
-	agent.log.Info("Snat Local Object added/Updated ", snat)
-	agent.doUpdateSnatLocalInfo(key)
+	agent.log.Info("Policy Info Added: ", policyinfokey)
+	agent.snatPolicyCache[policyinfo.ObjectMeta.Name] = policyinfo
+	agent.handleSnatUpdate(policyinfo)
+}
+
+func (agent *HostAgent) snatPolicyUpdated(oldobj interface{}, newobj interface{}) {
+	agent.indexMutex.Lock()
+	defer agent.indexMutex.Unlock()
+	oldpolicyinfo := oldobj.(*snatpolicy.SnatPolicy)
+	newpolicyinfo := newobj.(*snatpolicy.SnatPolicy)
+	policyinfokey, err := cache.MetaNamespaceKeyFunc(newpolicyinfo)
+	if err != nil {
+		return
+	}
+	if reflect.DeepEqual(oldpolicyinfo, newpolicyinfo) {
+		return
+	}
+	agent.snatPolicyCache[newpolicyinfo.ObjectMeta.Name] = newpolicyinfo
+	agent.log.Debug("Policy Info Updated: ", policyinfokey)
+	agent.handleSnatUpdate(newpolicyinfo)
+}
+
+func (agent *HostAgent) snatPolicyDeleted(obj interface{}) {
+	agent.indexMutex.Lock()
+	defer agent.indexMutex.Unlock()
+	policyinfo := obj.(*snatpolicy.SnatPolicy)
+	policyinfokey, err := cache.MetaNamespaceKeyFunc(policyinfo)
+	if err != nil {
+		return
+	}
+	agent.log.Debug("Policy Info Deleted: ", policyinfokey)
+	delete(agent.snatPolicyCache, policyinfo.ObjectMeta.Name)
+	agent.handleSnatUpdate(policyinfo)
+}
+
+func (agent *HostAgent) handleSnatUpdate(policy *snatpolicy.SnatPolicy) {
+	// First Parse the policy and check for applicability
+	// list all the Pods based on labels and namespace
+	agent.log.Info("Handle snatUpdate: ", policy)
+	_, err := cache.MetaNamespaceKeyFunc(policy)
+	if err != nil {
+		return
+	}
+	if _, ok := agent.snatPolicyCache[policy.ObjectMeta.Name]; !ok {
+		agent.deletePolicy(policy)
+		return
+	}
+	// 1.List the targets matching the policy based on policy config
+	// 2. find the pods policy is applicable update the pod's policy priority list
+	// 3. check the policy is active then Update the NodeInfo with policy.
+	uids := make(map[ResourceType][]string)
+	if len(policy.Spec.SnatIp) == 0 {
+		//handle policy for service pods
+		var services []*v1.Service
+		var poduids []string
+		selector := labels.SelectorFromSet(labels.Set(policy.Spec.Selector.Labels))
+		cache.ListAll(agent.serviceInformer.GetIndexer(), selector,
+			func(servobj interface{}) {
+				services = append(services, servobj.(*v1.Service))
+			})
+		// list the pods and apply the policy at service target
+		for _, service := range services {
+			uids, _ := agent.getPodsMatchingObjet(service, policy.Spec.Selector.Namespace, policy.ObjectMeta.Name)
+			poduids = append(poduids, uids...)
+		}
+		uids[SERVICE] = poduids
+	} else if reflect.DeepEqual(policy.Spec.Selector, snatpolicy.PodSelector{}) {
+		// This Policy will be applied at cluster level
+		var poduids []string
+		// handle policy for cluster
+		for k, _ := range agent.opflexEps {
+			poduids = append(poduids, k)
+		}
+		uids[CLUSTER] = poduids
+	} else if len(policy.Spec.Selector.Labels) == 0 {
+		// This is namespace based policy
+		var poduids []string
+		cache.ListAllByNamespace(agent.podInformer.GetIndexer(), policy.Spec.Selector.Namespace, labels.Everything(),
+			func(podobj interface{}) {
+				pod := podobj.(*v1.Pod)
+				if pod.Spec.NodeName == agent.config.NodeName {
+					poduids = append(poduids, string(pod.ObjectMeta.UID))
+				}
+			})
+		uids[NAMESPACE] = poduids
+	} else {
+		poduids, deppoduids, nspoduids :=
+			agent.getPodUidsMatchingLabel(policy.Spec.Selector.Namespace, policy.Spec.Selector.Labels, policy.ObjectMeta.Name)
+		uids[POD] = poduids
+		uids[DEPLOYMENT] = deppoduids
+		uids[NAMESPACE] = nspoduids
+	}
+	for res, poduids := range uids {
+		agent.applyPolicy(poduids, res, policy.GetName())
+
+	}
+}
+
+func (agent *HostAgent) getPodUidsMatchingLabel(namespace string, label map[string]string, policyname string) (poduids []string,
+	deppoduids []string, nspoduids []string) {
+	// Get all pods matching the label
+	// Get all deployments matching the label
+	// Get all the namespaces matching the policy label
+	selector := labels.SelectorFromSet(labels.Set(label))
+	cache.ListAll(agent.podInformer.GetIndexer(), selector,
+		func(podobj interface{}) {
+			pod := podobj.(*v1.Pod)
+			if pod.Spec.NodeName == agent.config.NodeName {
+				poduids = append(poduids, string(pod.ObjectMeta.UID))
+			}
+		})
+	cache.ListAll(agent.depInformer.GetIndexer(), selector,
+		func(depobj interface{}) {
+			dep := depobj.(*appsv1.Deployment)
+			uids, _ := agent.getPodsMatchingObjet(dep, namespace, policyname)
+			deppoduids = append(deppoduids, uids...)
+		})
+	cache.ListAll(agent.nsInformer.GetIndexer(), selector,
+		func(nsobj interface{}) {
+			ns := nsobj.(*v1.Namespace)
+			uids, _ := agent.getPodsMatchingObjet(ns, namespace, policyname)
+			nspoduids = append(nspoduids, uids...)
+		})
+	return
+}
+
+func (agent *HostAgent) applyPolicy(poduids []string, res ResourceType, snatPolicyName string) {
+	nodeUpdate := false
+	if _, ok := agent.snatPods[snatPolicyName]; !ok {
+		agent.snatPods[snatPolicyName] = make(map[string]ResourceType)
+		nodeUpdate = true
+	}
+	for _, uid := range poduids {
+		_, ok := agent.opflexSnatLocalInfos[uid]
+		if !ok {
+			var localinfo OpflexSnatLocalInfo
+			localinfo.Snatpolicies = make(map[ResourceType][]string)
+			localinfo.Snatpolicies[res] = append(localinfo.Snatpolicies[res], snatPolicyName)
+			agent.opflexSnatLocalInfos[uid] = &localinfo
+			agent.snatPods[snatPolicyName][uid] |= res
+
+		} else {
+			agent.opflexSnatLocalInfos[uid].Snatpolicies[res] =
+				append(agent.opflexSnatLocalInfos[uid].Snatpolicies[res], snatPolicyName)
+			agent.snatPods[snatPolicyName][uid] |= res
+			// trigger update  the epfile
+		}
+	}
+	agent.log.Info("applypolicy: ", agent.snatPods[snatPolicyName])
+	if nodeUpdate == true {
+		agent.scheduleSyncNodeInfo()
+	} else {
+		agent.updateEpFiles(poduids)
+	}
+	return
+}
+
+func (agent *HostAgent) syncSnatNodeInfo() bool {
+	snatPolicyNames := make(map[string]bool)
+	for key, _ := range agent.snatPods {
+		snatPolicyNames[key] = true
+	}
+	env := agent.env.(*K8sEnvironment)
+	if env == nil {
+		return false
+	}
+	// send nodeupdate as the policy is active
+	if agent.InformNodeInfo(env.nodeInfo, snatPolicyNames) == false {
+		return true
+	}
+	return false
+}
+
+func (agent *HostAgent) deletePolicy(policy *snatpolicy.SnatPolicy) {
+	pods, ok := agent.snatPods[policy.GetName()]
+	var poduids []string
+	if !ok {
+		return
+	}
+	for uuid, res := range pods {
+		agent.deleteSnatLocalInfo(uuid, res, policy.GetName())
+		poduids = append(poduids, uuid)
+	}
+	agent.updateEpFiles(poduids)
+	return
+}
+
+func (agent *HostAgent) deleteSnatLocalInfo(poduid string, res ResourceType, plcyname string) {
+	localinfo, ok := agent.opflexSnatLocalInfos[poduid]
+	if ok {
+		i := uint(0)
+		j := uint(0)
+		for i < uint(res) {
+			i = 1 << j
+			j = j + 1
+			if i&uint(res) == i {
+				policeis := localinfo.Snatpolicies[ResourceType(i)]
+				for k, name := range policeis {
+					if name == plcyname {
+						localinfo.Snatpolicies[ResourceType(i)] = append(localinfo.Snatpolicies[ResourceType(i)][:k],
+							localinfo.Snatpolicies[ResourceType(i)][k+1:]...)
+					}
+				}
+				if len(localinfo.Snatpolicies[res]) == 0 {
+					delete(localinfo.Snatpolicies, res)
+					agent.snatPods[plcyname][poduid] &= ^(res) // clear the bit
+				}
+			}
+		}
+		// remove policy stack.
+	}
 }
 
 func (agent *HostAgent) snatGlobalInfoUpdate(obj interface{}) {
@@ -228,64 +448,8 @@ func (agent *HostAgent) snatGlobalInfoUpdate(obj interface{}) {
 			Error("Could not create key:" + err.Error())
 		return
 	}
-	agent.log.Info("Snat Local Object added/Updated ", snat)
+	agent.log.Info("Snat Global Object added/Updated ", snat)
 	agent.doUpdateSnatGlobalInfo(key)
-}
-
-func (agent *HostAgent) doUpdateSnatLocalInfo(key string) {
-	snatobj, exists, err :=
-		agent.snatLocalInformer.GetStore().GetByKey(key)
-	if err != nil {
-		agent.log.Error("Could not lookup snat for " +
-			key + ": " + err.Error())
-		return
-	}
-	if !exists || snatobj == nil {
-		return
-	}
-	snat := snatobj.(*snatlocal.SnatLocalInfo)
-	logger := SnatLocalInfoLogger(agent.log, snat)
-	agent.snatLocalInfoChanged(snatobj, logger)
-}
-
-func (agent *HostAgent) snatLocalInfoChanged(snatobj interface{}, logger *logrus.Entry) {
-	snat := snatobj.(*snatlocal.SnatLocalInfo)
-	if logger == nil {
-		logger = agent.log.WithFields(logrus.Fields{})
-	}
-	logger.Debug("Snat local info Changed...")
-	localInfo := snat.Spec.LocalInfos
-	syncep := false
-	// This case is true when scope moves from namespace to deployment
-	if len(localInfo) < len(agent.opflexSnatLocalInfos) {
-		for poduid, v := range agent.opflexSnatLocalInfos {
-			if _, ok := localInfo[poduid]; !ok {
-				// if pod present mark it snat ip deleted for local info
-				if _, ok := agent.opflexEps[poduid]; ok {
-					v.MarkDelete = true
-					syncep = true
-				} else {
-					delete(agent.opflexSnatLocalInfos, poduid)
-				}
-			}
-		}
-	}
-	for poduid, v := range localInfo {
-		localInfo := &OpflexSnatLocalInfo{
-			SnatIp:     v.SnatIp,
-			MarkDelete: false,
-		}
-		if _, ok := agent.opflexSnatLocalInfos[poduid]; !ok {
-			agent.opflexSnatLocalInfos[poduid] = localInfo
-			syncep = true
-		} else if agent.opflexSnatLocalInfos[poduid] != localInfo {
-			agent.opflexSnatLocalInfos[poduid] = localInfo
-			syncep = true
-		}
-	}
-	if syncep {
-		agent.scheduleSyncEps()
-	}
 }
 
 func (agent *HostAgent) doUpdateSnatGlobalInfo(key string) {
@@ -315,6 +479,7 @@ func fileExists(filename string) bool {
 func (agent *HostAgent) snaGlobalInfoChanged(snatobj interface{}, logger *logrus.Entry) {
 	snat := snatobj.(*snatglobal.SnatGlobalInfo)
 	syncSnat := false
+	updateLocalInfo := false
 	if logger == nil {
 		logger = agent.log.WithFields(logrus.Fields{})
 	}
@@ -329,7 +494,6 @@ func (agent *HostAgent) snaGlobalInfoChanged(snatobj interface{}, logger *logrus
 			}
 		}
 	}
-	agent.log.Debug("Snat Gobal Obj Map: ", globalInfo)
 	for nodename, val := range globalInfo {
 		var newglobalinfos []*OpflexSnatGlobalInfo
 		for _, v := range val {
@@ -337,11 +501,11 @@ func (agent *HostAgent) snaGlobalInfoChanged(snatobj interface{}, logger *logrus
 			portrange[0].Start = v.PortRanges[0].Start
 			portrange[0].End = v.PortRanges[0].End
 			nodeInfo := &OpflexSnatGlobalInfo{
-				SnatIp:     v.SnatIp,
-				MacAddress: v.MacAddress,
-				PortRange:  portrange,
-				SnatIpUid:  v.SnatIpUid,
-				Protocols:  v.Protocols,
+				SnatIp:         v.SnatIp,
+				MacAddress:     v.MacAddress,
+				PortRange:      portrange,
+				SnatIpUid:      v.SnatIpUid,
+				SnatPolicyName: v.SnatPolicyName,
 			}
 			newglobalinfos = append(newglobalinfos, nodeInfo)
 		}
@@ -349,9 +513,11 @@ func (agent *HostAgent) snaGlobalInfoChanged(snatobj interface{}, logger *logrus
 		if (ok && !reflect.DeepEqual(existing, newglobalinfos)) || !ok {
 			agent.opflexSnatGlobalInfos[nodename] = newglobalinfos
 			syncSnat = true
+			if nodename == agent.config.NodeName {
+				updateLocalInfo = true
+			}
 		}
 	}
-	agent.log.Debug("Snat Gobal Obj Map: ", agent.opflexSnatGlobalInfos)
 
 	snatFileName := SnatService + ".service"
 	filePath := filepath.Join(agent.config.OpFlexServiceDir, snatFileName)
@@ -398,25 +564,14 @@ func (agent *HostAgent) snaGlobalInfoChanged(snatobj interface{}, logger *logrus
 	if syncSnat {
 		agent.scheduleSyncSnats()
 	}
-}
-func (agent *HostAgent) snatLocalInfoDelete(obj interface{}) {
-	agent.log.Debug("Snat Local Info Obj Delete")
-	snat := obj.(*snatlocal.SnatLocalInfo)
-	localInfo := snat.Spec.LocalInfos
-	syncep := false
-	for poduid, _ := range localInfo {
-		if _, ok := agent.opflexSnatLocalInfos[poduid]; ok {
-			if _, ok := agent.opflexEps[poduid]; ok {
-				// if pod present mark it snat ip deleted for local info
-				agent.opflexSnatLocalInfos[poduid].MarkDelete = true
-				syncep = true
-			} else {
-				delete(agent.opflexSnatLocalInfos, poduid)
+	if updateLocalInfo {
+		var poduids []string
+		for _, v := range agent.opflexSnatGlobalInfos[agent.config.NodeName] {
+			for uuid, _ := range agent.snatPods[v.SnatPolicyName] {
+				poduids = append(poduids, uuid)
 			}
 		}
-	}
-	if syncep {
-		agent.scheduleSyncEps()
+		agent.updateEpFiles(poduids)
 	}
 }
 
@@ -429,7 +584,6 @@ func (agent *HostAgent) snatGlobalInfoDelete(obj interface{}) {
 			delete(agent.opflexSnatGlobalInfos, nodename)
 		}
 	}
-	agent.scheduleSyncSnats()
 }
 
 func (agent *HostAgent) syncSnat() bool {
@@ -440,11 +594,6 @@ func (agent *HostAgent) syncSnat() bool {
 	agent.indexMutex.Lock()
 	opflexSnatIps := make(map[string]*OpflexSnatIp)
 	remoteinfo := make(map[string][]OpflexSnatIpRemoteInfo)
-	local := make(map[string]bool)
-	//set all the local SnatIp's
-	for _, v := range agent.opflexSnatLocalInfos {
-		local[v.SnatIp] = true
-	}
 	// set the remote info for every snatIp
 	for nodename, v := range agent.opflexSnatGlobalInfos {
 		for _, ginfo := range v {
@@ -463,9 +612,7 @@ func (agent *HostAgent) syncSnat() bool {
 
 	if ok {
 		for _, ginfo := range ginfos {
-			if local[ginfo.SnatIp] {
-				localportrange[ginfo.SnatIp] = ginfo.PortRange
-			}
+			localportrange[ginfo.SnatIp] = ginfo.PortRange
 		}
 	}
 
@@ -475,10 +622,11 @@ func (agent *HostAgent) syncSnat() bool {
 			// set the local portrange
 			snatinfo.InterfaceName = agent.config.UplinkIface
 			snatinfo.InterfaceVlan = agent.config.ServiceVlan
+			snatinfo.Local = false
 			if _, ok := localportrange[ginfo.SnatIp]; ok {
 				snatinfo.PortRange = localportrange[ginfo.SnatIp]
+				snatinfo.Local = true
 			}
-			snatinfo.Local = local[ginfo.SnatIp]
 			snatinfo.SnatIp = ginfo.SnatIp
 			snatinfo.Uuid = ginfo.SnatIpUid
 			snatinfo.Zone = agent.config.Zone
@@ -536,5 +684,202 @@ func (agent *HostAgent) syncSnat() bool {
 		}
 	}
 	agent.log.Debug("Finished snat sync")
+	return false
+}
+
+func (agent *HostAgent) getPodsMatchingObjet(obj interface{}, namespace string, policyname string) (poduids []string, res ResourceType) {
+	switch obj.(type) {
+	case *v1.Pod:
+		pod, _ := obj.(*v1.Pod)
+		if agent.isPolicyNameSpaceMatches(namespace, pod.ObjectMeta.Namespace) {
+			poduids = append(poduids, string(pod.ObjectMeta.UID))
+		}
+		res = POD
+	case *appsv1.Deployment:
+		deployment, _ := obj.(*appsv1.Deployment)
+		depkey, _ :=
+			cache.MetaNamespaceKeyFunc(deployment)
+		if agent.isPolicyNameSpaceMatches(policyname, deployment.ObjectMeta.Namespace) {
+			for _, podkey := range agent.depPods.GetPodForObj(depkey) {
+				podobj, exists, _ := agent.podInformer.GetStore().GetByKey(podkey)
+				if exists && podobj != nil && podobj.(*v1.Pod).Spec.NodeName == agent.config.NodeName {
+					poduids = append(poduids, string(podobj.(*v1.Pod).ObjectMeta.UID))
+				}
+			}
+		}
+		res = DEPLOYMENT
+	case *v1.Service, *v1.Endpoints:
+		key, _ :=
+			cache.MetaNamespaceKeyFunc(obj)
+		asobj, exists, err := agent.serviceInformer.GetStore().GetByKey(key)
+		if err != nil {
+			agent.log.Error("Could not lookup service for " +
+				key + ": " + err.Error())
+			return
+		}
+		if !exists || asobj == nil {
+			return
+		}
+		service, _ := obj.(*v1.Service)
+		selector := labels.SelectorFromSet(labels.Set(service.Spec.Selector))
+		if agent.isPolicyNameSpaceMatches(policyname, service.ObjectMeta.Namespace) {
+			cache.ListAllByNamespace(agent.podInformer.GetIndexer(), service.ObjectMeta.Namespace, selector,
+				func(podobj interface{}) {
+					pod := podobj.(*v1.Pod)
+					if pod.Spec.NodeName == agent.config.NodeName {
+						poduids = append(poduids, string(pod.ObjectMeta.UID))
+					}
+				})
+		}
+		res = SERVICE
+	case *v1.Namespace:
+		ns, _ := obj.(*v1.Namespace)
+		if agent.isPolicyNameSpaceMatches(policyname, ns.ObjectMeta.Name) {
+			cache.ListAllByNamespace(agent.podInformer.GetIndexer(), namespace, labels.Everything(),
+				func(podobj interface{}) {
+					pod := podobj.(*v1.Pod)
+					if pod.Spec.NodeName == agent.config.NodeName {
+						poduids = append(poduids, string(pod.ObjectMeta.UID))
+					}
+				})
+		}
+		res = NAMESPACE
+	default:
+	}
+	return
+}
+
+func (agent *HostAgent) updateEpFiles(poduids []string) {
+	for _, uid := range poduids {
+		localinfo, ok := agent.opflexSnatLocalInfos[uid]
+		if !ok {
+			continue
+		}
+		agent.log.Info("local info:####", agent.opflexSnatLocalInfos[uid])
+		var i uint = 1
+		var pos uint = 1
+		var policystack []string
+		for ; i <= uint(CLUSTER); i = 1 << pos {
+			pos = pos + 1
+			visted := make(map[string]bool)
+			policies, ok := localinfo.Snatpolicies[ResourceType(i)]
+			if ok {
+				for _, name := range policies {
+					if _, ok := visted[name]; !ok {
+						visted[name] = true
+					} else {
+						continue
+					}
+				}
+				sort.Slice(policies, func(i, j int) bool { return agent.comapare(policies[i], policies[j]) })
+			}
+			policystack = append(policystack, policies...)
+		}
+		var uids []string
+		for _, name := range policystack {
+			for _, val := range agent.opflexSnatGlobalInfos[agent.config.NodeName] {
+				if val.SnatPolicyName == name {
+					uids = append(uids, val.SnatIpUid)
+				}
+			}
+		}
+		if !reflect.DeepEqual(agent.opflexSnatLocalInfos[uid].PlcyUuids, uids) {
+			agent.opflexSnatLocalInfos[uid].PlcyUuids = uids
+			agent.log.Info("Update EpFile", uids)
+			agent.scheduleSyncEps()
+		}
+
+	}
+}
+
+func (agent *HostAgent) comapare(plcy1, plcy2 string) bool {
+	a := agent.snatPolicyCache[plcy1].Spec.DestIp[0] // currently handling one IP needs to be extended to list of IP's
+	b := agent.snatPolicyCache[plcy2].Spec.DestIp[0]
+	ipA, _, _ := net.ParseCIDR(a)
+	_, ipnetB, _ := net.ParseCIDR(b)
+	if ipnetB.Contains(ipA) {
+		return true
+	} else {
+		return false
+	}
+}
+
+func (agent *HostAgent) getMatchingSnatPolicy(label map[string]string, namespace string) (snatPolicyNames map[string]bool) {
+	for _, item := range agent.snatPolicyCache {
+		if reflect.DeepEqual(item.Spec.Selector, snatpolicy.PodSelector{}) ||
+			(len(item.Spec.Selector.Labels) == 0 && item.Spec.Selector.Namespace == namespace) {
+			continue
+		}
+		if util.MatchLabels(item.Spec.Selector.Labels, label) {
+			if (item.Spec.Selector.Namespace != "" && item.Spec.Selector.Namespace == namespace) ||
+				(item.Spec.Selector.Namespace == "") {
+				snatPolicyNames[item.ObjectMeta.Name] = true
+			}
+		}
+	}
+	return
+}
+
+func (agent *HostAgent) handleObjectUpdate(obj interface{}, label map[string]string, deleted bool) {
+	objKey, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		return
+	}
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return
+	}
+	plcynames, ok := agent.snatPolicyLabels[objKey]
+	if !ok {
+		plcynames := agent.getMatchingSnatPolicy(metadata.GetLabels(), metadata.GetNamespace())
+		for name, _ := range plcynames {
+			poduids, res := agent.getPodsMatchingObjet(obj, metadata.GetNamespace(), name)
+			agent.applyPolicy(poduids, res, name)
+			agent.snatPolicyLabels[objKey] = append(agent.snatPolicyLabels[objKey], name)
+		}
+		//get matching policy apply the policy
+		// set the labels if it matches with label or namespace or cluster level
+
+	} else {
+		if deleted {
+			for _, name := range plcynames {
+				poduids, res := agent.getPodsMatchingObjet(obj, metadata.GetNamespace(), name)
+				for _, uid := range poduids {
+					agent.deleteSnatLocalInfo(uid, res, name)
+				}
+			}
+			delete(agent.snatPolicyLabels, objKey)
+		} else {
+			matchnames := agent.getMatchingSnatPolicy(metadata.GetLabels(), metadata.GetNamespace())
+			for _, name := range plcynames {
+				if _, ok := matchnames[name]; !ok {
+					poduids, res := agent.getPodsMatchingObjet(obj, metadata.GetNamespace(), name)
+					for _, uid := range poduids {
+						agent.deleteSnatLocalInfo(uid, res, name)
+					}
+				} else {
+					matchnames[name] = false
+				}
+			}
+
+			for name, val := range matchnames {
+				if val == false {
+					poduids, res := agent.getPodsMatchingObjet(obj, metadata.GetNamespace(), name)
+					agent.applyPolicy(poduids, res, name)
+					agent.snatPolicyLabels[objKey] = append(agent.snatPolicyLabels[objKey], name)
+				}
+			}
+		}
+	}
+}
+
+func (agent *HostAgent) isPolicyNameSpaceMatches(policyName string, namespace string) bool {
+	policy, ok := agent.snatPolicyCache[policyName]
+	if ok {
+		if len(policy.Spec.Selector.Namespace) == 0 || (len(policy.Spec.Selector.Namespace) > 0 &&
+			policy.Spec.Selector.Namespace == namespace) {
+			return true
+		}
+	}
 	return false
 }
