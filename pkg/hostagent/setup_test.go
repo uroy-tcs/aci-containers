@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestGetSandboxUserId(t *testing.T) {
+/*func TestGetSandboxUserId(t *testing.T) {
 	log := testAgent().log.WithField("test", "TestGetSandboxUserId")
 
 	exp_uid := fmt.Sprintf("%d", os.Getuid())
@@ -31,4 +31,4 @@ func TestGetSandboxUserId(t *testing.T) {
 		getSandboxUserId(log, fmt.Sprintf("/proc/%d/ns/net", os.Getpid())))
 
 	assert.Equal(t, "", getSandboxUserId(log, "/var/vcap/data/1234"))
-}
+}*/
