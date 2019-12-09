@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aci-operator-config
+  namespace: aci-containers-system
+  labels:
+    aci-containers-config-version: "dummy"
+    network-plugin: aci-containers
+data:
+  spec: |-
+    {
+        "flavor": "openshift-4.3",
+        "config": ""
+    }
