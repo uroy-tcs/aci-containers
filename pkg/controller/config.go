@@ -238,7 +238,10 @@ func InitFlags(config *ControllerConfig) {
 func (cont *AciController) loadIpRanges(v4 *ipam.IpAlloc, v6 *ipam.IpAlloc,
 	ipranges []ipam.IpRange) {
 
+        cont.log.Debug("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$")
+        cont.log.Debug(len(ipranges))
 	for _, r := range ipranges {
+                cont.log.Debug("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		if r.Start.To4() != nil && r.End.To4() != nil {
 			v4.AddRange(r.Start, r.End)
 		} else if r.Start.To16() != nil && r.End.To16() != nil {
