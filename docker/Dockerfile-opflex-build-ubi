@@ -1,0 +1,47 @@
+FROM opflex-build-base-ubi
+ARG BUILDOPTS="--enable-grpc --enable-prometheus"
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/share/pkgconfig
+WORKDIR /opflex
+RUN git clone https://github.com/noironetworks/opflex.git
+ARG make_args=-j3
+RUN mkdir ~/.m2 && echo '<settings> \
+<proxies> \
+<proxy> \
+<id>example-proxy</id> \
+<active>true</active> \
+<protocol>http</protocol> \
+<host>proxy.esl.cisco.com</host> \
+<port>80</port> \
+</proxy> \
+</proxies> \
+</settings>' > ~/.m2/settings.xml
+RUN cd /opflex/opflex/libopflex \
+  && ./autogen.sh && ./configure --disable-assert \
+  && make $make_args && make install
+RUN cd /opflex/opflex/genie \
+  && mvn compile exec:java
+RUN cd /opflex/opflex/genie/target/libmodelgbp \
+  && sh autogen.sh && ./configure --disable-static \
+  && make $make_args && make install
+RUN cd /opflex/opflex/agent-ovs \
+  && ./autogen.sh && ./configure $BUILDOPTS \
+  && make $make_args && make install
+RUN for p in `find /usr/local/lib/ /usr/local/bin/ -type f \(\
+    -name 'opflex_agent' -o \
+    -name 'gbp_inspect' -o \
+    -name 'mcast_daemon' -o \
+    -name 'opflex_server' -o \
+    -name 'libopflex*so*' -o \
+    -name 'libmodelgbp*so*' -o \
+    -name 'libopenvswitch*so*' -o \
+    -name 'libsflow*so*' -o \
+    -name 'libprometheus-cpp-*so*' -o \
+    -name 'libgrpc*so*' -o \
+    -name 'libgpr*so*' -o \
+    -name 'libuv*so*' -o \
+    -name 'libofproto*so*' \
+    \)`; do \
+       objcopy --only-keep-debug "$p" "$p.debug"; \
+       objcopy --strip-debug "$p"; \
+       objcopy --add-gnu-debuglink="$p.debug" "$p"; \
+     done
