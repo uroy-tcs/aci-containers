@@ -17,15 +17,16 @@ RUN mkdir ~/.m2 && echo '<settings> \
 </settings>' > ~/.m2/settings.xml
 RUN cd /opflex/opflex/libopflex \
   && ./autogen.sh && ./configure --disable-assert \
-  && make $make_args && make install
+  && make $make_args && make install && make clean
 RUN cd /opflex/opflex/genie \
   && mvn compile exec:java
 RUN cd /opflex/opflex/genie/target/libmodelgbp \
   && sh autogen.sh && ./configure --disable-static \
-  && make $make_args && make install
+  && make $make_args && make install && make clean \
+  && cd /opflex/opflex/genie && mvn clean && rm -rf ~/.m2
 RUN cd /opflex/opflex/agent-ovs \
   && ./autogen.sh && ./configure $BUILDOPTS \
-  && make $make_args && make install
+  && make $make_args && make install && make clean
 RUN for p in `find /usr/local/lib/ /usr/local/bin/ -type f \(\
     -name 'opflex_agent' -o \
     -name 'gbp_inspect' -o \
