@@ -19,9 +19,9 @@ fi
 pushd opflex/genie
 mvn compile exec:java
 popd
-cp ../../docker/Dockerfile-opflex-build opflex
-docker build ${DOCKER_BUILD_ARGS} --build-arg make_args="${MAKE_ARGS}" -t noiro/opflex-build -f opflex/Dockerfile-opflex-build opflex
-docker run noiro/opflex-build tar -c -C /usr/local \
+cp ../../docker/Dockerfile-opflex-build-ubi opflex
+docker build ${DOCKER_BUILD_ARGS} --build-arg make_args="${MAKE_ARGS}" -t noiro/opflex-build-ubi -f opflex/Dockerfile-opflex-build-ubi opflex
+docker run noiro/opflex-build-ubi tar -c -C /usr/local \
        bin/opflex_agent bin/gbp_inspect bin/mcast_daemon \
     | tar -x -C dist
 docker run -w /usr/local noiro/opflex-build /bin/sh -c 'find lib \(\
