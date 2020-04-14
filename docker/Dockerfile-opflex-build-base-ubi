@@ -51,5 +51,5 @@ RUN git clone https://github.com/openvswitch/ovs.git --branch v2.12.0 --depth 1 
   && mv $ROOT/include/openflow $ROOT/include/openvswitch \
   && cp include/*.h "$ROOT/include/openvswitch/" \
   && find lib -name "*.h" -exec cp --parents {} "$ROOT/include/openvswitch/" \;
-#RUN cd ovs && make clean;
+RUN cd /ovs && make clean;
 
