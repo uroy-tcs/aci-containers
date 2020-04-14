@@ -23,6 +23,10 @@ if [ -w ${PREFIX} ]; then
     mkdir -p ${VARDIR}/lib/opflex-agent-ovs/droplog
 fi
 
+if [ ! -d ${VARDIR}/lib/opflex-agent-ovs/endpoints ]; then
+  echo "Error - unable to write to ${VARDIR}"
+fi
+
 if [ -d ${OPFLEXAGENT_CONF_PATH} ]; then
     cat <<EOF > ${OPFLEXAGENT_DISABLED_CONF}
 {
