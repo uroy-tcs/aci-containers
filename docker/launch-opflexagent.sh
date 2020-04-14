@@ -42,6 +42,12 @@ if [ -d ${OPFLEXAGENT_CONF_PATH} ]; then
 EOF
 fi
 
+if [ -d ${OPFLEXAGENT} ]; then
+  echo "Agent binary exists at ${OPFLEXAGENT}"
+else
+  echo "No agent binary present";
+fi
+
 if [ "$REBOOT_WITH_OVS" == "true" ]; then
 	exec ${OPFLEXAGENT} -w \
 		 -c ${OPFLEXAGENT_DISABLED_CONF} \
