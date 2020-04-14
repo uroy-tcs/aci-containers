@@ -1,30 +1,18 @@
-FROM opflex-build-base-ubi
+FROM noiro/opflex-build-base-ubi
 ARG BUILDOPTS="--enable-grpc --enable-prometheus"
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/share/pkgconfig
 WORKDIR /opflex
-RUN git clone https://github.com/noironetworks/opflex.git
+COPY libopflex /opflex/libopflex
 ARG make_args=-j3
-RUN mkdir ~/.m2 && echo '<settings> \
-<proxies> \
-<proxy> \
-<id>example-proxy</id> \
-<active>true</active> \
-<protocol>http</protocol> \
-<host>proxy.esl.cisco.com</host> \
-<port>80</port> \
-</proxy> \
-</proxies> \
-</settings>' > ~/.m2/settings.xml
-RUN cd /opflex/opflex/libopflex \
+RUN cd /opflex/libopflex \
   && ./autogen.sh && ./configure --disable-assert \
   && make $make_args && make install && make clean
-RUN cd /opflex/opflex/genie \
-  && mvn compile exec:java
-RUN cd /opflex/opflex/genie/target/libmodelgbp \
+COPY genie /opflex/genie
+RUN cd /opflex/genie/target/libmodelgbp \
   && sh autogen.sh && ./configure --disable-static \
-  && make $make_args && make install && make clean \
-  && cd /opflex/opflex/genie && mvn clean && rm -rf ~/.m2
-RUN cd /opflex/opflex/agent-ovs \
+  && make $make_args && make install && make clean
+COPY agent-ovs /opflex/agent-ovs
+RUN cd /opflex/agent-ovs \
   && ./autogen.sh && ./configure $BUILDOPTS \
   && make $make_args && make install && make clean
 RUN for p in `find /usr/local/lib/ /usr/local/bin/ -type f \(\
