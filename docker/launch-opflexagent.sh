@@ -45,7 +45,7 @@ fi
 if [ -d ${OPFLEXAGENT} ]; then
   echo "Agent binary exists at ${OPFLEXAGENT}"
 else
-  echo "No agent binary present";
+  echo "No agent binary present at ${OPFLEXAGENT}"
 fi
 
 if [ "$REBOOT_WITH_OVS" == "true" ]; then
@@ -60,3 +60,4 @@ else
 		 -c ${OPFLEXAGENT_BASE_CONF} \
 		 -c ${OPFLEXAGENT_CONFD}
 fi
+/bin/sh
