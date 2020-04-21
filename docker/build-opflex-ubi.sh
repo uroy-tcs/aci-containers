@@ -42,6 +42,6 @@ cp ../../docker/launch-mcastdaemon.sh dist/bin/
 
 # Build the minimal OpFlex container
 cp ../../docker/Dockerfile-opflex-ubi dist
-docker build ${DOCKER_BUILD_ARGS} -t noiro/opflex -f dist/Dockerfile-opflex-ubi dist
+docker build ${DOCKER_BUILD_ARGS} -t noiro/opflex-ubi -f dist/Dockerfile-opflex-ubi dist
 
 popd
