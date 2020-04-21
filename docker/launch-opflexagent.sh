@@ -23,10 +23,6 @@ if [ -w ${PREFIX} ]; then
     mkdir -p ${VARDIR}/lib/opflex-agent-ovs/droplog
 fi
 
-if [ ! -d ${VARDIR}/lib/opflex-agent-ovs/endpoints ]; then
-  echo "Error - unable to write to ${VARDIR}"
-fi
-
 if [ -d ${OPFLEXAGENT_CONF_PATH} ]; then
     cat <<EOF > ${OPFLEXAGENT_DISABLED_CONF}
 {
@@ -42,12 +38,6 @@ if [ -d ${OPFLEXAGENT_CONF_PATH} ]; then
 EOF
 fi
 
-if [ -d ${OPFLEXAGENT} ]; then
-  echo "Agent binary exists at ${OPFLEXAGENT}"
-else
-  echo "No agent binary present at ${OPFLEXAGENT}"
-fi
-
 if [ "$REBOOT_WITH_OVS" == "true" ]; then
 	exec ${OPFLEXAGENT} -w \
 		 -c ${OPFLEXAGENT_DISABLED_CONF} \
@@ -60,4 +50,3 @@ else
 		 -c ${OPFLEXAGENT_BASE_CONF} \
 		 -c ${OPFLEXAGENT_CONFD}
 fi
-/bin/sh
