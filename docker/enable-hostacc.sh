@@ -5,6 +5,8 @@ set -x
 
 PREFIX=/usr/local
 VARDIR=${PREFIX}/var
+ACIBIN=${PREFIX}/bin
+HOSTAGENT=${ACIBIN}/aci-containers-host-agent
 
 function check_eth {
     ip link show "$1" | grep -q "$1"
@@ -30,15 +32,20 @@ else
 fi
 ACC_MAC=$(get_mac veth_host)
 
-if check_eth enp0s8; then
-    VTEP_IP=$(get_ip enp0s8)
-    VTEP_IFACE=enp0s8
+vtep=$($HOSTAGENT -get-vtep)
+retval=$?
+if [ $retval -ne 0 ]; then
+    echo "error getting vtep"
+    exit $retval
 else
-    VTEP_IFACE=$(ip -o route get 8.8.8.8 | sed -e 's/^.*dev \([^ ]*\) .*$/\1/')
-    VTEP_IP=$(get_ip ${VTEP_IFACE})
+read VTEP_IFACE VTEP_IP_CIDR <<EOF
+    $vtep
+EOF
 fi
 
-if [[ ! -z "$VTEP_IFACE" && ! -z "$VTEP_IP" ]]; then
+echo "using vtep $VTEP_IFACE $VTEP_IP_CIDR"
+
+if [[ ! -z "$VTEP_IFACE" && ! -z "$VTEP_IP_CIDR" ]]; then
 
     set +e
 
@@ -73,6 +80,8 @@ if [[ ! -z "$VTEP_IFACE" && ! -z "$VTEP_IP" ]]; then
     fi
 
     set -e
+
+    VTEP_IP=$(echo $VTEP_IP_CIDR | awk -F '/' '{print $1}')
     # Create Host EP file
     UUID=${HOSTNAME}_${VTEP_IP}_veth_host_ac
     #FNAME=${UUID}.ep
@@ -84,7 +93,7 @@ cat <<EOF > ${VARDIR}/lib/opflex-agent-ovs/endpoints/${FNAME}
   "eg-policy-space": "$TENANT",
   "endpoint-group-name": "$NODE_EPG",
   "ip": [
-    "$VTEP_IP"
+    "$VTEP_IP_CIDR"
   ],
   "mac": "$ACC_MAC",
   "disable-adv": true,

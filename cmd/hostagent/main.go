@@ -21,11 +21,17 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"strings"
 
 	"github.com/Sirupsen/logrus"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
 
 	"github.com/noironetworks/aci-containers/pkg/hostagent"
 )
@@ -38,6 +44,8 @@ func main() {
 	configPath := flag.String("config-path", "",
 		"Absolute path to a host agent configuration file")
 	version := flag.Bool("version", false, "prints github commit ID and build time")
+	getIP := flag.Bool("get-node-ip", false, "prints IP address of this node")
+	getVtep := flag.Bool("get-vtep", false, "prints VTEP ip and interface for this node")
 	flag.Parse()
 
 	if *version {
@@ -48,6 +56,43 @@ func main() {
 			fmt.Println("Information missing in current build")
 		}
 		os.Exit(0)
+	}
+
+	if *getIP {
+		ip, err := getNodeIP()
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(-1)
+		}
+
+		fmt.Println(ip)
+		os.Exit(0)
+	}
+
+	if *getVtep {
+		ip, err := getNodeIP()
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(-1)
+		}
+		ifaces, err := net.Interfaces()
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(-1)
+		}
+		for _, i := range ifaces {
+			addrs, err := i.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, a := range addrs {
+				if strings.HasPrefix(a.String(), ip) {
+					fmt.Println(i.Name, a.String())
+					os.Exit(0)
+				}
+			}
+		}
+		os.Exit(-1)
 	}
 
 	if configPath != nil && *configPath != "" {
@@ -96,16 +141,50 @@ func main() {
 		panic(err.Error())
 	}
 
-        if hostagent.GetVersion().GitCommit != "" {
-                versionInfo := hostagent.GetVersion()
-                log.Info("Running hostagent built from git commit ID " +
-                          versionInfo.GitCommit + " at build time " +
-                          versionInfo.BuildTime)
-        }
+	if hostagent.GetVersion().GitCommit != "" {
+		versionInfo := hostagent.GetVersion()
+		log.Info("Running hostagent built from git commit ID " +
+			versionInfo.GitCommit + " at build time " +
+			versionInfo.BuildTime)
+	}
 
 	agent := hostagent.NewHostAgent(config, env, log)
 	agent.Init()
 	agent.Run(wait.NeverStop)
 	agent.RunPacketEventListener(wait.NeverStop)
 	agent.RunStatus()
+}
+
+func getNodeIP() (string, error) {
+	var options metav1.ListOptions
+	nodeName := os.Getenv("KUBERNETES_NODE_NAME")
+	if nodeName == "" {
+		return "", fmt.Errorf("KUBERNETES_NODE_NAME must be set")
+	}
+
+	restconfig, err := restclient.InClusterConfig()
+	if err != nil {
+		return "", fmt.Errorf("Error getting config: %v", err)
+	}
+
+	kubeClient, err := kubernetes.NewForConfig(restconfig)
+	if err != nil {
+		return "", fmt.Errorf("Error initializing client: %v", err)
+	}
+
+	options.FieldSelector = fields.Set{"metadata.name": nodeName}.String()
+	nodeList, err := kubeClient.CoreV1().Nodes().List(options)
+	if err != nil {
+		return "", fmt.Errorf("Error listing nodes: %v", err)
+	}
+
+	for _, node := range nodeList.Items {
+		for _, a := range node.Status.Addresses {
+			if a.Type == v1.NodeInternalIP {
+				return a.Address, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("Failed to list node")
 }

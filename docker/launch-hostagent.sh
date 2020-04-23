@@ -45,6 +45,8 @@ else
     echo "running in on prem mode"
 fi
 
+${ACIBIN}/enable-droplog.sh
+
 CMD=${HOSTAGENT}
 if [ -f ${HOSTAGENT_CONF} ]; then
     CMD="${CMD} -config-path ${HOSTAGENT_CONF}"
