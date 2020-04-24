@@ -1,6 +1,6 @@
 FROM registry.access.redhat.com/ubi8/ubi-minimal:latest
-RUN microdnf --disablerepo=\*ubi\* update && \
-  microdnf --disablerepo=\*ubi\* install --enablerepo=openstack-15-for-rhel-8-x86_64-rpms \
+RUN microdnf update && \
+  microdnf install --enablerepo=openstack-15-for-rhel-8-x86_64-rpms \
   --enablerepo=fast-datapath-for-rhel-8-x86_64-rpms libstdc++ libuv \
   boost-program-options boost-system boost-date-time boost-filesystem \
   boost-iostreams libnetfilter_conntrack openssl net-tools procps-ng && yum clean all
