@@ -1,11 +1,11 @@
 FROM registry.access.redhat.com/ubi8/ubi-minimal:latest
 ENV ROOT=/usr/local
-RUN microdnf update && microdnf install --enablerepo codeready-builder-for-rhel-8-x86_64-rpms \
+ARG make_args=-j4
+RUN microdnf install --enablerepo codeready-builder-for-rhel-8-x86_64-rpms \
     libtool pkgconfig autoconf automake make cmake file python2-six \
     openssl-devel git gcc gcc-c++ boost-devel diffutils python2-devel \
     libnetfilter_conntrack-devel wget which curl-devel procps zlib-devel \
     && microdnf clean all
-ARG make_args=-j4
 RUN wget https://github.com/Tencent/rapidjson/archive/v1.1.0.tar.gz \
   && tar xvfz v1.1.0.tar.gz \
   && cd rapidjson-1.1.0 \
@@ -13,14 +13,17 @@ RUN wget https://github.com/Tencent/rapidjson/archive/v1.1.0.tar.gz \
   && cp -R include/rapidjson/ /usr/local/include/ \
   && mkdir /usr/local/lib/pkgconfig \
   && cp RapidJSON.pc /usr/local/lib/pkgconfig/
-RUN git clone https://github.com/libuv/libuv.git --branch v1.20.3 --depth 1 \
+  && cd
+  && git clone https://github.com/libuv/libuv.git --branch v1.20.3 --depth 1 \
   && cd libuv \
   && ./autogen.sh \
   && ./configure \
   && make $make_args \
   && make install && make clean
-RUN git clone https://github.com/noironetworks/3rdparty-debian.git
-RUN git clone https://github.com/jupp0r/prometheus-cpp.git \
+  && cd
+  && git clone https://github.com/noironetworks/3rdparty-debian.git
+  && cd
+  && git clone https://github.com/jupp0r/prometheus-cpp.git --depth 1 \
   && cd prometheus-cpp \
   && git checkout 9effb90b0c266316358680cbf862a8564eb2c2d4 \
   && git submodule init \
@@ -30,7 +33,8 @@ RUN git clone https://github.com/jupp0r/prometheus-cpp.git \
   && cmake .. -DBUILD_SHARED_LIBS=ON \
   && make $make_args && make install && make clean \
   && mv /usr/local/lib64/libprometheus-cpp-* /usr/local/lib/
-RUN git clone https://github.com/grpc/grpc \
+  && cd
+  && git clone https://github.com/grpc/grpc --depth 1 \
   && cd grpc \
   && git checkout 5052efd666ab6fdda2a4b3045569f70ce0c5fa57 \
   && git submodule update --init \
