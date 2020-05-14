@@ -8,13 +8,13 @@ COPY agent-ovs /opflex/agent-ovs
 ARG make_args=-j4
 RUN cd /opflex/libopflex \
   && ./autogen.sh && ./configure --disable-assert \
-  && make $make_args && make install && make clean
+  && make $make_args && make install && make clean \
   && cd /opflex/genie/target/libmodelgbp \
   && sh autogen.sh && ./configure --disable-static \
-  && make $make_args && make install && make clean
+  && make $make_args && make install && make clean \
   && cd /opflex/agent-ovs \
   && ./autogen.sh && ./configure $BUILDOPTS \
-  && make $make_args && make install && make clean
+  && make $make_args && make install && make clean \
   && for p in `find /usr/local/lib/ /usr/local/bin/ -type f \(\
     -name 'opflex_agent' -o \
     -name 'gbp_inspect' -o \
