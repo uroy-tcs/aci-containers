@@ -17,15 +17,16 @@
 package hostagent
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/sirupsen/logrus"
 	snatglobal "github.com/noironetworks/aci-containers/pkg/snatglobalinfo/apis/aci.snat/v1"
 	snatglobalclset "github.com/noironetworks/aci-containers/pkg/snatglobalinfo/clientset/versioned"
 	snatlocal "github.com/noironetworks/aci-containers/pkg/snatlocalinfo/apis/aci.snat/v1"
 	snatpolicy "github.com/noironetworks/aci-containers/pkg/snatpolicy/apis/aci.snat/v1"
 	snatpolicyclset "github.com/noironetworks/aci-containers/pkg/snatpolicy/clientset/versioned"
 	"github.com/noironetworks/aci-containers/pkg/util"
+	"github.com/sirupsen/logrus"
 	"io/ioutil"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -224,7 +225,6 @@ func (agent *HostAgent) initSnatPolicyInformerBase(listWatch *cache.ListWatch) {
 func (agent *HostAgent) snatPolicyAdded(obj interface{}) {
 	agent.indexMutex.Lock()
 	defer agent.indexMutex.Unlock()
-	agent.log.Info("Policy Info Added: ")
 	policyinfo := obj.(*snatpolicy.SnatPolicy)
 	agent.log.Info("Policy Info Added: ", policyinfo.ObjectMeta.Name)
 	if policyinfo.Status.State != snatpolicy.Ready {
@@ -259,7 +259,6 @@ func (agent *HostAgent) snatPolicyUpdated(oldobj interface{}, newobj interface{}
 			}
 		}
 		if !ok || !present {
-			agent.log.Info("Delete Policy: ", newpolicyinfo.ObjectMeta.Name)
 			agent.deletePolicy(newpolicyinfo, false)
 		}
 		return
@@ -275,21 +274,27 @@ func (agent *HostAgent) snatPolicyUpdated(oldobj interface{}, newobj interface{}
 		return
 	}
 	update := true
-	// updateEpFile
-	//TODO need to revisit the code is it  good to update first and then delete
 	if !reflect.DeepEqual(oldpolicyinfo.Spec.Selector,
 		newpolicyinfo.Spec.Selector) {
-		// remove poduids matching the policy
 		var poduids []string
+		// delete all the pods matching the policy
 		for uuid, res := range agent.snatPods[newpolicyinfo.ObjectMeta.Name] {
 			agent.deleteSnatLocalInfo(uuid, res, newpolicyinfo.ObjectMeta.Name)
 			poduids = append(poduids, uuid)
 		}
 		agent.updateEpFiles(poduids)
 		agent.handleSnatUpdate(newpolicyinfo)
-		// this trigger handles if handle snatUpdate don't match any pod
-		if len(poduids) > 0 {
+		var matchingpods []string
+		for uuid, _ := range agent.snatPods[newpolicyinfo.ObjectMeta.Name] {
+			matchingpods = append(matchingpods, uuid)
+		}
+		// Nodeinfo trigger handles if handlesnatUpdate don't match any pods
+		// this trigger clears the globalinfo allocated for node
+		if len(poduids) > 0 && len(matchingpods) == 0 {
 			agent.scheduleSyncNodeInfo()
+		} else {
+			// Epfiles needs to be updated if there are any  pods matching with newlabel
+			agent.updateEpFiles(matchingpods)
 		}
 		update = false
 	}
@@ -302,6 +307,7 @@ func (agent *HostAgent) snatPolicyUpdated(oldobj interface{}, newobj interface{}
 		for uid := range agent.snatPods[newpolicyinfo.ObjectMeta.Name] {
 			poduids = append(poduids, uid)
 		}
+		// This EPfiles update based on destip chanes policy order is maintained
 		agent.updateEpFiles(poduids)
 		agent.scheduleSyncSnats()
 	}
@@ -433,7 +439,7 @@ func (agent *HostAgent) applyPolicy(poduids []string, res ResourceType, snatPoli
 			localinfo.Snatpolicies[res] = append(localinfo.Snatpolicies[res], snatPolicyName)
 			agent.opflexSnatLocalInfos[uid] = &localinfo
 			agent.snatPods[snatPolicyName][uid] |= res
-			agent.log.Debug("applypolicy Res: ", agent.snatPods[snatPolicyName][uid])
+			agent.log.Debug("Apply policy res: ", agent.snatPods[snatPolicyName][uid])
 
 		} else {
 			present := false
@@ -446,12 +452,12 @@ func (agent *HostAgent) applyPolicy(poduids []string, res ResourceType, snatPoli
 				agent.opflexSnatLocalInfos[uid].Snatpolicies[res] =
 					append(agent.opflexSnatLocalInfos[uid].Snatpolicies[res], snatPolicyName)
 				agent.snatPods[snatPolicyName][uid] |= res
-				agent.log.Debug("applypolicy Res: ", agent.snatPods[snatPolicyName][uid])
+				agent.log.Debug("Apply policy res: ", agent.snatPods[snatPolicyName][uid])
 			}
 		}
 	}
 	if nodeUpdate == true {
-		agent.log.Debug("Schedule the node Sync:")
+		agent.log.Debug("Schedule the node Sync")
 		agent.scheduleSyncNodeInfo()
 	} else {
 		// trigger update  the epfile
@@ -529,7 +535,7 @@ func (agent *HostAgent) deleteSnatLocalInfo(poduid string, res ResourceType, plc
 						deletedcount++
 					}
 				}
-				agent.log.Debug("Opflex agent and localinfo ", agent.opflexSnatLocalInfos[poduid], localinfo)
+				agent.log.Debug("Opflex agent and localinfo: ", agent.opflexSnatLocalInfos[poduid], localinfo)
 				if len(localinfo.Snatpolicies[res]) == 0 {
 					delete(localinfo.Snatpolicies, res)
 				}
@@ -560,7 +566,7 @@ func (agent *HostAgent) snatGlobalInfoUpdate(obj interface{}) {
 			Error("Could not create key:" + err.Error())
 		return
 	}
-	agent.log.Info("Snat Global Object added/Updated ", snat)
+	agent.log.Info("Snat Global Object added/Updated: ", snat)
 	agent.doUpdateSnatGlobalInfo(key)
 }
 
@@ -824,7 +830,7 @@ func (agent *HostAgent) getPodsMatchingObjet(obj interface{}, policyname string)
 	case *v1.Pod:
 		pod, _ := obj.(*v1.Pod)
 		poduids = append(poduids, string(pod.ObjectMeta.UID))
-		agent.log.Info("Pod uid: ", poduids)
+		agent.log.Info("Matching pod uids: ", poduids)
 	case *appsv1.Deployment:
 		deployment, _ := obj.(*appsv1.Deployment)
 		depkey, _ :=
@@ -841,7 +847,7 @@ func (agent *HostAgent) getPodsMatchingObjet(obj interface{}, policyname string)
 			}
 			poduids = append(poduids, string(podobj.(*v1.Pod).ObjectMeta.UID))
 		}
-		agent.log.Info("Deployment Pod uid: ", poduids)
+		agent.log.Info("Matching deployment pod uids: ", poduids)
 		res = DEPLOYMENT
 	case *v1.Service:
 		service, _ := obj.(*v1.Service)
@@ -854,7 +860,7 @@ func (agent *HostAgent) getPodsMatchingObjet(obj interface{}, policyname string)
 					poduids = append(poduids, string(pod.ObjectMeta.UID))
 				}
 			})
-		agent.log.Info("Service Pod uid: ", poduids)
+		agent.log.Info("Matcing service pod uids: ", poduids)
 		res = SERVICE
 	case *v1.Namespace:
 		ns, _ := obj.(*v1.Namespace)
@@ -866,7 +872,7 @@ func (agent *HostAgent) getPodsMatchingObjet(obj interface{}, policyname string)
 					poduids = append(poduids, string(pod.ObjectMeta.UID))
 				}
 			})
-		agent.log.Info("NameSpace: ", poduids)
+		agent.log.Info("Matching namespace pod uids: ", poduids)
 		res = NAMESPACE
 	default:
 	}
@@ -945,16 +951,9 @@ func (agent *HostAgent) compare(plcy1, plcy2 string) bool {
 			if ip_temp != nil && ip_temp.To4() != nil {
 				b = b + "/32"
 			}
-			ipB, _, _ := net.ParseCIDR(b)
-			_, ipnetA, _ := net.ParseCIDR(a)
-			ipA, _, _ := net.ParseCIDR(a)
-			_, ipnetB, _ := net.ParseCIDR(b)
-			switch {
-			case ipnetA.Contains(ipB):
-				sort = false
-			case ipnetB.Contains(ipA):
-				sort = true
-			default:
+			// TODO need to handle if the order is reversed across the policies.
+			// order reversing is ideally a wrong config. may be we need to block at verfication level
+			if compareIps(a, b) == true {
 				sort = true
 			}
 		}
@@ -1066,7 +1065,6 @@ func (agent *HostAgent) handleObjectUpdateForSnat(obj interface{}) {
 	if err != nil {
 		return
 	}
-	agent.log.Info("handleObjectUpdateForSnat: ", objKey)
 	plcynames, ok := agent.snatPolicyLabels[objKey]
 	if !ok {
 		agent.snatPolicyLabels[objKey] = make(map[string]ResourceType)
@@ -1078,7 +1076,6 @@ func (agent *HostAgent) handleObjectUpdateForSnat(obj interface{}) {
 		for name, resources := range polcies {
 			for _, res := range resources {
 				poduids, _ := agent.getPodsMatchingObjet(obj, name)
-				agent.log.Info("HandleObject Update/Matching Pod Uid's: ", poduids)
 				if len(agent.snatPolicyCache[name].Spec.Selector.Labels) == 0 {
 					agent.applyPolicy(poduids, res, name)
 				} else {
@@ -1131,17 +1128,12 @@ func (agent *HostAgent) handleObjectDeleteForSnat(obj interface{}) {
 	if err != nil {
 		return
 	}
-	metadata, err := meta.Accessor(obj)
-	if err != nil {
-		return
-	}
-	agent.log.Debug("HandleObject Delete: ", objKey)
 	plcynames := agent.getMatchingSnatPolicy(obj)
 	var podidlist []string
 	sync := false
 	for name, resources := range plcynames {
+		agent.log.Infof("Handle snatpolicy as object deleted: %s,  ObjectKey: %s", name, objKey)
 		poduids, _ := agent.getPodsMatchingObjet(obj, name)
-		agent.log.Debug("Object deleted: ", poduids, metadata.GetNamespace(), name)
 		for _, uid := range poduids {
 			if getResourceType(obj) == SERVICE {
 				agent.log.Debug("Service deleted update the localInfo: ", name)
@@ -1219,14 +1211,26 @@ func setDestIp(destIp []string) {
 			if ip_temp != nil && ip_temp.To4() != nil {
 				b = b + "/32"
 			}
-			ipB, _, _ := net.ParseCIDR(b)
-			_, ipnetA, _ := net.ParseCIDR(a)
-			if ipnetA.Contains(ipB) {
-				return false
-			}
-			return true
+			return compareIps(a, b)
 		})
 	}
+}
+
+func compareIps(ipa string, ipb string) bool {
+	ipB, ipnetB, _ := net.ParseCIDR(ipb)
+	_, ipnetA, _ := net.ParseCIDR(ipa)
+	if ipnetA.Contains(ipB) {
+		// if the Ipa contains the Ipb
+		//the above check can be true if example IP CIDR's are 10.10.0.0/16 10.10.0.0/24
+		// if ip's are equal check the masks
+		if ipnetA.IP.Equal(ipnetB.IP) {
+			if bytes.Compare(ipnetA.Mask, ipnetB.Mask) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 func getResourceType(obj interface{}) ResourceType {
