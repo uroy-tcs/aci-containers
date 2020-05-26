@@ -154,7 +154,12 @@ func (env *K8sEnvironment) Init(cont *AciController) error {
 	cont.initReplicaSetInformerFromClient(kubeClient)
 	cont.initDeploymentInformerFromClient(kubeClient)
 	cont.initPodInformerFromClient(kubeClient)
-	cont.initEndpointsInformerFromClient(kubeClient)
+	cont.initEndpointSliceInformerFromClient(kubeClient)
+	if cont.endPointSliceEnabled {
+		cont.initEndpointSliceInformerFromClient(kubeClient)
+	} else {
+		cont.initEndpointsInformerFromClient(kubeClient)
+	}
 	cont.initServiceInformerFromClient(kubeClient)
 	cont.initNetworkPolicyInformerFromClient(kubeClient)
 	cont.initSnatInformerFromClient(snatClient)
@@ -201,17 +206,27 @@ func (env *K8sEnvironment) PrepareRun(stopCh <-chan struct{}) error {
 	cont.indexMutex.Unlock()
 	cont.nodeFullSync()
 	cont.log.Info("Node/namespace cache sync successful")
-
-	go cont.endpointsInformer.Run(stopCh)
+	if cont.endPointSliceEnabled {
+		go cont.endpointSliceInformer.Run(stopCh)
+	} else {
+		go cont.endpointsInformer.Run(stopCh)
+	}
 	go cont.serviceInformer.Run(stopCh)
 	go cont.processQueue(cont.serviceQueue, cont.serviceIndexer,
 		func(obj interface{}) bool {
 			return cont.handleServiceUpdate(obj.(*v1.Service))
 		}, stopCh)
 	cont.log.Debug("Waiting for service cache sync")
-	cache.WaitForCacheSync(stopCh,
-		cont.endpointsInformer.HasSynced,
-		cont.serviceInformer.HasSynced)
+	if cont.endPointSliceEnabled {
+		cont.log.Debug("Waiting for EndPointSlicecache sync")
+		cache.WaitForCacheSync(stopCh,
+			cont.endpointSliceInformer.HasSynced,
+			cont.serviceInformer.HasSynced)
+	} else {
+		cache.WaitForCacheSync(stopCh,
+			cont.endpointsInformer.HasSynced,
+			cont.serviceInformer.HasSynced)
+	}
 	cont.indexMutex.Lock()
 	cont.serviceSyncEnabled = true
 	cont.indexMutex.Unlock()

@@ -27,7 +27,9 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
+	v1beta1 "k8s.io/api/discovery/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
@@ -117,6 +119,39 @@ func (agent *HostAgent) initEndpointsInformerBase(listWatch *cache.ListWatch) {
 		},
 		DeleteFunc: func(obj interface{}) {
 			agent.endpointsChanged(obj)
+		},
+	})
+}
+
+func (agent *HostAgent) initEndpointSliceInformerFromClient(
+	kubeClient *kubernetes.Clientset) {
+	agent.initEndpointSliceInformerBase(
+		&cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				return kubeClient.DiscoveryV1beta1().EndpointSlices(metav1.NamespaceAll).List(context.TODO(), options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				return kubeClient.DiscoveryV1beta1().EndpointSlices(metav1.NamespaceAll).Watch(context.TODO(), options)
+			},
+		})
+}
+
+func (agent *HostAgent) initEndpointSliceInformerBase(listWatch *cache.ListWatch) {
+	agent.endpointSliceInformer = cache.NewSharedIndexInformer(
+		listWatch,
+		&v1beta1.EndpointSlice{},
+		controller.NoResyncPeriodFunc(),
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+	)
+	agent.endpointSliceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			agent.endpointSliceChanged(obj)
+		},
+		UpdateFunc: func(_ interface{}, obj interface{}) {
+			agent.endpointSliceChanged(obj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			agent.endpointSliceChanged(obj)
 		},
 	})
 }
@@ -267,7 +302,7 @@ func (agent *HostAgent) syncServices() bool {
 
 // Must have index lock
 func (agent *HostAgent) updateServiceDesc(external bool, as *v1.Service,
-	endpoints *v1.Endpoints) bool {
+	endpoints *v1.Endpoints, endpointSlice *v1beta1.EndpointSlice) bool {
 
 	if as.Spec.ClusterIP == "None" {
 		agent.log.Debug("ClusterIP is set to None")
@@ -308,12 +343,53 @@ func (agent *HostAgent) updateServiceDesc(external bool, as *v1.Service,
 	}
 	hasValidMapping := false
 	for _, sp := range as.Spec.Ports {
-		for _, e := range endpoints.Subsets {
-			for _, p := range e.Ports {
-				if p.Protocol != sp.Protocol {
+		if !agent.endPointSliceEnabled {
+			for _, e := range endpoints.Subsets {
+				for _, p := range e.Ports {
+					if p.Protocol != sp.Protocol {
+						continue
+					}
+					if p.Name != sp.Name {
+						continue
+					}
+
+					sm := &opflexServiceMapping{
+						ServicePort:  uint16(sp.Port),
+						ServiceProto: strings.ToLower(string(sp.Protocol)),
+						NextHopIps:   make([]string, 0),
+						NextHopPort:  uint16(p.Port),
+						Conntrack:    true,
+						NodePort:     uint16(sp.NodePort),
+					}
+
+					if external {
+						if as.Spec.Type == v1.ServiceTypeLoadBalancer &&
+							len(as.Status.LoadBalancer.Ingress) > 0 {
+							sm.ServiceIp = as.Status.LoadBalancer.Ingress[0].IP
+						}
+					} else {
+						sm.ServiceIp = as.Spec.ClusterIP
+					}
+
+					for _, a := range e.Addresses {
+						if !external ||
+							(a.NodeName != nil && *a.NodeName == agent.config.NodeName) {
+							sm.NextHopIps = append(sm.NextHopIps, a.IP)
+						}
+					}
+					if sm.ServiceIp != "" && len(sm.NextHopIps) > 0 {
+						hasValidMapping = true
+					}
+					ofas.ServiceMappings = append(ofas.ServiceMappings, *sm)
+				}
+			}
+		} else {
+			for _, p := range endpointSlice.Ports {
+				if p.Protocol != nil && *p.Protocol != sp.Protocol {
 					continue
 				}
-				if p.Name != sp.Name {
+
+				if p.Name != nil && *p.Name != sp.Name {
 					continue
 				}
 
@@ -321,7 +397,7 @@ func (agent *HostAgent) updateServiceDesc(external bool, as *v1.Service,
 					ServicePort:  uint16(sp.Port),
 					ServiceProto: strings.ToLower(string(sp.Protocol)),
 					NextHopIps:   make([]string, 0),
-					NextHopPort:  uint16(p.Port),
+					NextHopPort:  uint16(*p.Port),
 					Conntrack:    true,
 					NodePort:     uint16(sp.NodePort),
 				}
@@ -335,10 +411,12 @@ func (agent *HostAgent) updateServiceDesc(external bool, as *v1.Service,
 					sm.ServiceIp = as.Spec.ClusterIP
 				}
 
-				for _, a := range e.Addresses {
-					if !external ||
-						(a.NodeName != nil && *a.NodeName == agent.config.NodeName) {
-						sm.NextHopIps = append(sm.NextHopIps, a.IP)
+				for _, e := range endpointSlice.Endpoints {
+					for _, a := range e.Addresses {
+						nodeName, ok := e.Topology["kubernetes.io/hostname"]
+						if !external || (ok && nodeName == agent.config.NodeName) {
+							sm.NextHopIps = append(sm.NextHopIps, a)
+						}
 					}
 				}
 				if sm.ServiceIp != "" && len(sm.NextHopIps) > 0 {
@@ -346,6 +424,7 @@ func (agent *HostAgent) updateServiceDesc(external bool, as *v1.Service,
 				}
 				ofas.ServiceMappings = append(ofas.ServiceMappings, *sm)
 			}
+
 		}
 	}
 
@@ -374,7 +453,7 @@ func (agent *HostAgent) updateServiceDesc(external bool, as *v1.Service,
 							continue
 						}
 						InfraIp := agent.getInfrastucreIp(as.ObjectMeta.Name)
-						agent.log.Debug("InfraIp####: ", InfraIp)
+						agent.log.Debug("InfraIp: ", InfraIp)
 						if InfraIp == "" {
 							continue
 						}
@@ -409,17 +488,6 @@ func (agent *HostAgent) updateServiceDesc(external bool, as *v1.Service,
 
 // must have index lock
 func (agent *HostAgent) doUpdateService(key string) {
-	endpointsobj, exists, err :=
-		agent.endpointsInformer.GetStore().GetByKey(key)
-	if err != nil {
-		agent.log.Error("Could not lookup endpoints for " +
-			key + ": " + err.Error())
-		return
-	}
-	if !exists || endpointsobj == nil {
-		agent.log.Debug("no endpoints: ")
-		return
-	}
 	asobj, exists, err := agent.serviceInformer.GetStore().GetByKey(key)
 	if err != nil {
 		agent.log.Error("Could not lookup service for " +
@@ -429,12 +497,36 @@ func (agent *HostAgent) doUpdateService(key string) {
 	if !exists || asobj == nil {
 		return
 	}
-
-	endpoints := endpointsobj.(*v1.Endpoints)
 	as := asobj.(*v1.Service)
 	doSync := false
-	doSync = agent.updateServiceDesc(false, as, endpoints) || doSync
-	doSync = agent.updateServiceDesc(true, as, endpoints) || doSync
+	if !agent.endPointSliceEnabled {
+		endpointsobj, exists, err :=
+			agent.endpointsInformer.GetStore().GetByKey(key)
+		if err != nil {
+			agent.log.Error("Could not lookup endpoints for " +
+				key + ": " + err.Error())
+			return
+		}
+		if !exists || endpointsobj == nil {
+			agent.log.Debug("no endpoints: ")
+			return
+		}
+		endpoints := endpointsobj.(*v1.Endpoints)
+		doSync = agent.updateServiceDesc(false, as, endpoints, nil) || doSync
+		doSync = agent.updateServiceDesc(true, as, endpoints, nil) || doSync
+		if doSync {
+			agent.scheduleSyncServices()
+		}
+	} else {
+		label := map[string]string{"kubernetes.io/service-name": as.ObjectMeta.Name}
+		selector := labels.SelectorFromSet(labels.Set(label))
+		cache.ListAllByNamespace(agent.endpointSliceInformer.GetIndexer(), as.ObjectMeta.Namespace, selector,
+			func(endpointSliceobj interface{}) {
+				endpointSlices := endpointSliceobj.(*v1beta1.EndpointSlice)
+				doSync = agent.updateServiceDesc(false, as, nil, endpointSlices) || doSync
+				doSync = agent.updateServiceDesc(true, as, nil, endpointSlices) || doSync
+			})
+	}
 	if doSync {
 		agent.scheduleSyncServices()
 	}
@@ -451,6 +543,19 @@ func (agent *HostAgent) endpointsChanged(obj interface{}) {
 		agent.log.Error("Could not create key:" + err.Error())
 		return
 	}
+	agent.doUpdateService(key)
+}
+func getServiceKey(endPointSlice *v1beta1.EndpointSlice) string {
+	return endPointSlice.ObjectMeta.Namespace + "/" +
+		endPointSlice.ObjectMeta.GetLabels()[v1beta1.LabelServiceName]
+}
+
+func (agent *HostAgent) endpointSliceChanged(obj interface{}) {
+	agent.indexMutex.Lock()
+	defer agent.indexMutex.Unlock()
+	endpointslice := obj.(*v1beta1.EndpointSlice)
+	key := getServiceKey(endpointslice)
+	agent.log.Debug("EndPointSlice Changed for Service Key: ", key)
 	agent.doUpdateService(key)
 }
 

@@ -84,6 +84,8 @@ type AciController struct {
 	snatNodeInformer      cache.Controller
 	istioIndexer          cache.Indexer
 	istioInformer         cache.Controller
+	endpointSliceIndexer  cache.Indexer
+	endpointSliceInformer cache.Controller
 	snatCfgInformer       cache.Controller
 	updatePod             podUpdateFunc
 	updateNode            nodeUpdateFunc
@@ -132,6 +134,7 @@ type AciController struct {
 	syncQueue                 workqueue.RateLimitingInterface
 	syncProcessors            map[string]func() bool
 	snatPortExhaustedPolicies map[string]map[string]bool
+	endPointSliceEnabled      bool
 }
 
 type nodeServiceMeta struct {
@@ -230,12 +233,15 @@ func NewController(config *ControllerConfig, env Environment, log *logrus.Logger
 		snatGlobalInfoCache:       make(map[string]map[string]*snatglobalinfo.GlobalInfo),
 		istioCache:                make(map[string]*istiov1.AciIstioOperator),
 		snatPortExhaustedPolicies: make(map[string]map[string]bool),
+		endPointSliceEnabled:      false,
 	}
 	cont.syncProcessors = map[string]func() bool{
 		"snatGlobalInfo": cont.syncSnatGlobalInfo,
 		"rdConfig":       cont.syncRdConfig,
 		"istioCR":        cont.createIstioCR,
 	}
+	//@TODO need to set this value based on feature capability currently turnedoff
+	//cont.endPointSliceEnabled = true
 	return cont
 }
 

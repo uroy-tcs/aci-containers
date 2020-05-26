@@ -27,6 +27,7 @@ import (
 	"github.com/yl2chen/cidranger"
 
 	"github.com/noironetworks/aci-containers/pkg/metadata"
+	v1beta1 "k8s.io/api/discovery/v1beta1"
 )
 
 type testAciController struct {
@@ -36,6 +37,7 @@ type testAciController struct {
 	fakeNamespaceSource     *framework.FakeControllerSource
 	fakePodSource           *framework.FakeControllerSource
 	fakeEndpointsSource     *framework.FakeControllerSource
+	fakeEndpointSliceSource *framework.FakeControllerSource
 	fakeServiceSource       *framework.FakeControllerSource
 	fakeNodeSource          *framework.FakeControllerSource
 	fakeReplicaSetSource    *framework.FakeControllerSource
@@ -83,7 +85,12 @@ func testController() *testAciController {
 			ListFunc:  cont.fakeEndpointsSource.List,
 			WatchFunc: cont.fakeEndpointsSource.Watch,
 		})
-
+	cont.fakeEndpointSliceSource = framework.NewFakeControllerSource()
+	cont.initEndpointSliceInformerBase(
+		&cache.ListWatch{
+			ListFunc:  cont.fakeEndpointSliceSource.List,
+			WatchFunc: cont.fakeEndpointSliceSource.Watch,
+		})
 	cont.fakeServiceSource = framework.NewFakeControllerSource()
 	cont.initServiceInformerBase(
 		&cache.ListWatch{
@@ -316,5 +323,20 @@ func endpoints(namespace string, name string,
 			Name:        name,
 			Annotations: map[string]string{},
 		},
+	}
+}
+
+// endpointslice.
+func endpointslice(namespace string, name string, endpoints []v1beta1.Endpoint,
+	servicename string) *v1beta1.EndpointSlice {
+	return &v1beta1.EndpointSlice{
+		AddressType: v1beta1.AddressTypeIPv4,
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   namespace,
+			Labels:      map[string]string{v1beta1.LabelServiceName: servicename},
+			Annotations: map[string]string{},
+		},
+		Endpoints: endpoints,
 	}
 }

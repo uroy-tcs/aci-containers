@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"github.com/containernetworking/cni/pkg/types"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/time/rate"
 
@@ -46,31 +46,32 @@ type HostAgent struct {
 	indexMutex sync.Mutex
 	ipamMutex  sync.Mutex
 
-	opflexEps          map[string][]*opflexEndpoint
-	opflexServices     map[string]*opflexService
-	epMetadata         map[string]map[string]*md.ContainerMetadata
-	podIpToName        map[string]string
-	cniToPodID         map[string]string
-	serviceEp          md.ServiceEndpoint
-	crdClient          aciv1.AciV1Interface
-	podInformer        cache.SharedIndexInformer
-	endpointsInformer  cache.SharedIndexInformer
-	serviceInformer    cache.SharedIndexInformer
-	nodeInformer       cache.SharedIndexInformer
-	nsInformer         cache.SharedIndexInformer
-	netPolInformer     cache.SharedIndexInformer
-	depInformer        cache.SharedIndexInformer
-	rcInformer         cache.SharedIndexInformer
-	snatGlobalInformer cache.SharedIndexInformer
-	controllerInformer cache.SharedIndexInformer
-	snatPolicyInformer cache.SharedIndexInformer
-	rdConfigInformer   cache.SharedIndexInformer
-	netPolPods         *index.PodSelectorIndex
-	depPods            *index.PodSelectorIndex
-	rcPods             *index.PodSelectorIndex
-	podNetAnnotation   string
-	podIps             *ipam.IpCache
-	usedIPs            map[string]bool
+	opflexEps             map[string][]*opflexEndpoint
+	opflexServices        map[string]*opflexService
+	epMetadata            map[string]map[string]*md.ContainerMetadata
+	podIpToName           map[string]string
+	cniToPodID            map[string]string
+	serviceEp             md.ServiceEndpoint
+	crdClient             aciv1.AciV1Interface
+	podInformer           cache.SharedIndexInformer
+	endpointsInformer     cache.SharedIndexInformer
+	endpointSliceInformer cache.SharedIndexInformer
+	serviceInformer       cache.SharedIndexInformer
+	nodeInformer          cache.SharedIndexInformer
+	nsInformer            cache.SharedIndexInformer
+	netPolInformer        cache.SharedIndexInformer
+	depInformer           cache.SharedIndexInformer
+	rcInformer            cache.SharedIndexInformer
+	snatGlobalInformer    cache.SharedIndexInformer
+	controllerInformer    cache.SharedIndexInformer
+	snatPolicyInformer    cache.SharedIndexInformer
+	rdConfigInformer      cache.SharedIndexInformer
+	netPolPods            *index.PodSelectorIndex
+	depPods               *index.PodSelectorIndex
+	rcPods                *index.PodSelectorIndex
+	podNetAnnotation      string
+	podIps                *ipam.IpCache
+	usedIPs               map[string]bool
 
 	syncEnabled         bool
 	opflexConfigWritten bool
@@ -87,11 +88,12 @@ type HostAgent struct {
 	//snatpods per snat policy
 	snatPods map[string]map[string]ResourceType
 	//Object Key and list of labels active for snatpolicy
-	snatPolicyLabels map[string]map[string]ResourceType
-	snatPolicyCache  map[string]*snatpolicy.SnatPolicy
-	rdConfig         *opflexRdConfig
-	poster           *EventPoster
-	ocServices       []opflexOcService // OpenShiftservices
+	snatPolicyLabels     map[string]map[string]ResourceType
+	snatPolicyCache      map[string]*snatpolicy.SnatPolicy
+	rdConfig             *opflexRdConfig
+	poster               *EventPoster
+	ocServices           []opflexOcService // OpenShiftservices
+	endPointSliceEnabled bool
 }
 
 type Vtep struct {
@@ -138,6 +140,7 @@ func NewHostAgent(config *HostAgentConfig, env Environment, log *logrus.Logger) 
 				DefaultNs,
 			},
 		},
+		endPointSliceEnabled: false,
 	}
 
 	ha.syncProcessors = map[string]func() bool{
@@ -162,6 +165,8 @@ func NewHostAgent(config *HostAgentConfig, env Environment, log *logrus.Logger) 
 
 		ha.crdClient = aciawClient.AciV1()
 	}
+	// @TODO need to set the value based on capability currently turned off
+	//ha.endPointSliceEnabled = true
 	return ha
 }
 

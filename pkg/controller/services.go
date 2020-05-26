@@ -23,16 +23,16 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/noironetworks/aci-containers/pkg/apicapi"
+	"github.com/noironetworks/aci-containers/pkg/metadata"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
+	v1beta1 "k8s.io/api/discovery/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-
-	"github.com/noironetworks/aci-containers/pkg/apicapi"
-	"github.com/noironetworks/aci-containers/pkg/metadata"
 )
 
 // Default service contract scope value
@@ -48,6 +48,33 @@ func (cont *AciController) initEndpointsInformerFromClient(
 		cache.NewListWatchFromClient(
 			kubeClient.CoreV1().RESTClient(), "endpoints",
 			metav1.NamespaceAll, fields.Everything()))
+}
+
+func (cont *AciController) initEndpointSliceInformerFromClient(
+	kubeClient kubernetes.Interface) {
+
+	cont.initEndpointSliceInformerBase(
+		cache.NewListWatchFromClient(
+			kubeClient.DiscoveryV1beta1().RESTClient(), "endpointslices",
+			metav1.NamespaceAll, fields.Everything()))
+}
+
+func (cont *AciController) initEndpointSliceInformerBase(listWatch *cache.ListWatch) {
+	cont.endpointSliceIndexer, cont.endpointSliceInformer = cache.NewIndexerInformer(
+		listWatch, &v1beta1.EndpointSlice{}, 0,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				cont.endpointSliceAdded(obj)
+			},
+			UpdateFunc: func(old interface{}, new interface{}) {
+				cont.endpointSliceUpdated(old, new)
+			},
+			DeleteFunc: func(obj interface{}) {
+				cont.endpointSliceDeleted(obj)
+			},
+		},
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+	)
 }
 
 func (cont *AciController) initEndpointsInformerBase(listWatch *cache.ListWatch) {
@@ -227,25 +254,46 @@ func (cont *AciController) initStaticServiceObjs() {
 
 // can be called with index lock
 func (cont *AciController) updateServicesForNode(nodename string) {
-	cache.ListAll(cont.endpointsIndexer, labels.Everything(),
-		func(endpointsobj interface{}) {
-			endpoints := endpointsobj.(*v1.Endpoints)
-			for _, subset := range endpoints.Subsets {
-				for _, addr := range subset.Addresses {
-					if addr.NodeName != nil && *addr.NodeName == nodename {
+	if !cont.endPointSliceEnabled {
+		cache.ListAll(cont.endpointsIndexer, labels.Everything(),
+			func(endpointsobj interface{}) {
+				endpoints := endpointsobj.(*v1.Endpoints)
+				for _, subset := range endpoints.Subsets {
+					for _, addr := range subset.Addresses {
+						if addr.NodeName != nil && *addr.NodeName == nodename {
 
-						servicekey, err :=
-							cache.MetaNamespaceKeyFunc(endpointsobj.(*v1.Endpoints))
-						if err != nil {
-							cont.log.Error("Could not create endpoints key: ", err)
+							servicekey, err :=
+								cache.MetaNamespaceKeyFunc(endpointsobj.(*v1.Endpoints))
+							if err != nil {
+								cont.log.Error("Could not create endpoints key: ", err)
+								return
+							}
+							cont.queueServiceUpdateByKey(servicekey)
 							return
 						}
-						cont.queueServiceUpdateByKey(servicekey)
-						return
 					}
 				}
-			}
-		})
+			})
+	} else {
+		// 1. List all the endpointslice and check for matching nodename
+		// 2. if it matches trigger the Service update and mark it visited
+		visited := make(map[string]bool)
+		cache.ListAll(cont.endpointSliceIndexer, labels.Everything(),
+			func(endpointSliceobj interface{}) {
+				endpointSlices := endpointSliceobj.(*v1beta1.EndpointSlice)
+				for _, endpoint := range endpointSlices.Endpoints {
+					_, ok := endpoint.Topology["kubernetes.io/hostname"]
+					if ok && endpoint.Topology["kubernetes.io/hostname"] == nodename {
+						servicekey := getServiceKey(endpointSlices)
+						if _, ok := visited[servicekey]; !ok {
+							cont.queueServiceUpdateByKey(servicekey)
+							visited[servicekey] = true
+							return
+						}
+					}
+				}
+			})
+	}
 }
 
 // must have index lock
@@ -497,40 +545,70 @@ func apicFilterSnat(name string, tenantName string,
 
 	return filter
 }
+func (cont *AciController) getnodesMetadata(key string,
+	service *v1.Service) map[string]*metadata.ServiceEndpoint {
+	cont.indexMutex.Lock()
+	nodeMap := make(map[string]*metadata.ServiceEndpoint)
+	if !cont.endPointSliceEnabled {
+		endpointsobj, exists, err := cont.endpointsIndexer.GetByKey(key)
+		if err != nil {
+			cont.log.Error("Could not lookup endpoints for " +
+				key + ": " + err.Error())
+		}
+
+		if exists && endpointsobj != nil {
+			endpoints := endpointsobj.(*v1.Endpoints)
+			for _, subset := range endpoints.Subsets {
+				for _, addr := range subset.Addresses {
+					if addr.NodeName == nil {
+						continue
+					}
+					nodeMeta, ok := cont.nodeServiceMetaCache[*addr.NodeName]
+					if !ok {
+						continue
+					}
+					_, ok = cont.fabricPathForNode(*addr.NodeName)
+					if !ok {
+						continue
+					}
+					nodeMap[*addr.NodeName] = &nodeMeta.serviceEp
+				}
+			}
+		}
+		cont.log.Info("NodeMap: ", nodeMap)
+	} else {
+		// 1. Get all the Endpoint slices matching the label service-name
+		// 2. update the node map matching with endpoints nodes name
+		label := map[string]string{"kubernetes.io/service-name": service.ObjectMeta.Name}
+		selector := labels.SelectorFromSet(labels.Set(label))
+		cache.ListAllByNamespace(cont.endpointSliceIndexer, service.ObjectMeta.Namespace, selector,
+			func(endpointSliceobj interface{}) {
+				endpointSlices := endpointSliceobj.(*v1beta1.EndpointSlice)
+				for _, endpoint := range endpointSlices.Endpoints {
+					nodeName, ok := endpoint.Topology["kubernetes.io/hostname"]
+					if ok {
+						nodeMeta, ok := cont.nodeServiceMetaCache[nodeName]
+						_, ok = cont.fabricPathForNode(nodeName)
+						if !ok {
+							continue
+						}
+						if _, ok := nodeMap[nodeName]; ok {
+							continue
+						}
+						nodeMap[nodeName] = &nodeMeta.serviceEp
+					}
+				}
+			})
+		cont.log.Info("NodeMap: ", nodeMap)
+	}
+	cont.indexMutex.Unlock()
+	return nodeMap
+}
 
 func (cont *AciController) updateServiceDeviceInstance(key string,
 	service *v1.Service) error {
 
-	endpointsobj, exists, err := cont.endpointsIndexer.GetByKey(key)
-	if err != nil {
-		cont.log.Error("Could not lookup endpoints for " +
-			key + ": " + err.Error())
-		return err
-	}
-
-	cont.indexMutex.Lock()
-	nodeMap := make(map[string]*metadata.ServiceEndpoint)
-
-	if exists && endpointsobj != nil {
-		endpoints := endpointsobj.(*v1.Endpoints)
-		for _, subset := range endpoints.Subsets {
-			for _, addr := range subset.Addresses {
-				if addr.NodeName == nil {
-					continue
-				}
-				nodeMeta, ok := cont.nodeServiceMetaCache[*addr.NodeName]
-				if !ok {
-					continue
-				}
-				_, ok = cont.fabricPathForNode(*addr.NodeName)
-				if !ok {
-					continue
-				}
-				nodeMap[*addr.NodeName] = &nodeMeta.serviceEp
-			}
-		}
-	}
-	cont.indexMutex.Unlock()
+	nodeMap := cont.getnodesMetadata(key, service)
 
 	var nodes []string
 	for node := range nodeMap {
@@ -544,7 +622,7 @@ func (cont *AciController) updateServiceDeviceInstance(key string,
 		normScopeVal := strings.ToLower(scopeVal)
 		if !validScope(normScopeVal) {
 			errString := "Invalid service contract scope value provided " + scopeVal
-			err = errors.New(errString)
+			err := errors.New(errString)
 			serviceLogger(cont.log, service).Error("Could not create contract: ", err)
 			return err
 
@@ -978,18 +1056,50 @@ func (cont *AciController) opflexDeviceDeleted(dn string) {
 }
 
 func (cont *AciController) writeApicSvc(key string, service *v1.Service) {
-	endpointsobj, _, err := cont.endpointsIndexer.GetByKey(key)
-	if err != nil {
-		cont.log.Error("Could not lookup endpoints for " +
-			key + ": " + err.Error())
-		return
-	}
-
 	aobj := apicapi.NewVmmInjectedSvc(cont.vmmDomainProvider(),
 		cont.config.AciVmmDomain, cont.config.AciVmmController,
 		service.Namespace, service.Name)
 	aobjDn := aobj.GetDn()
 	aobj.SetAttr("guid", string(service.UID))
+	if !cont.endPointSliceEnabled {
+		endpointsobj, _, err := cont.endpointsIndexer.GetByKey(key)
+		if err != nil {
+			cont.log.Error("Could not lookup endpoints for " +
+				key + ": " + err.Error())
+			return
+		}
+		if endpointsobj != nil {
+			for _, subset := range endpointsobj.(*v1.Endpoints).Subsets {
+				for _, addr := range subset.Addresses {
+					if addr.TargetRef == nil || addr.TargetRef.Kind != "Pod" {
+						continue
+					}
+					aobj.AddChild(apicapi.NewVmmInjectedSvcEp(aobjDn,
+						addr.TargetRef.Name))
+				}
+			}
+		}
+	} else {
+		label := map[string]string{"kubernetes.io/service-name": service.ObjectMeta.Name}
+		selector := labels.SelectorFromSet(labels.Set(label))
+		epcount := 0
+		cache.ListAllByNamespace(cont.endpointSliceIndexer, service.ObjectMeta.Namespace, selector,
+			func(endpointSliceobj interface{}) {
+				endpointSlices := endpointSliceobj.(*v1beta1.EndpointSlice)
+				for _, endpoint := range endpointSlices.Endpoints {
+					if endpoint.TargetRef == nil || endpoint.TargetRef.Kind != "Pod" {
+						continue
+					}
+					epcount++
+					aobj.AddChild(apicapi.NewVmmInjectedSvcEp(aobjDn,
+						endpoint.TargetRef.Name))
+					cont.log.Debug("EndPoint added: ", endpoint.TargetRef.Name)
+				}
+			})
+		if epcount == 0 {
+			return
+		}
+	}
 	// APIC model only allows one of these
 	for _, ingress := range service.Status.LoadBalancer.Ingress {
 		aobj.SetAttr("lbIp", ingress.IP)
@@ -1024,19 +1134,8 @@ func (cont *AciController) writeApicSvc(key string, service *v1.Service) {
 		p.SetAttr("nodePort", strconv.Itoa(int(port.NodePort)))
 		aobj.AddChild(p)
 	}
-	if endpointsobj != nil {
-		for _, subset := range endpointsobj.(*v1.Endpoints).Subsets {
-			for _, addr := range subset.Addresses {
-				if addr.TargetRef == nil || addr.TargetRef.Kind != "Pod" {
-					continue
-				}
-				aobj.AddChild(apicapi.NewVmmInjectedSvcEp(aobjDn,
-					addr.TargetRef.Name))
-			}
-		}
-	}
-
 	name := cont.aciNameForKey("service-vmm", key)
+	cont.log.Debug("Write Service Object: ", aobj)
 	cont.apicConn.WriteApicObjects(name, apicapi.ApicSlice{aobj})
 }
 
@@ -1358,4 +1457,83 @@ func (cont *AciController) serviceFullSync() {
 		func(sobj interface{}) {
 			cont.queueServiceUpdate(sobj.(*v1.Service))
 		})
+}
+
+func (cont *AciController) getEndpointSliceIps(endpointSlice *v1beta1.EndpointSlice) map[string]bool {
+	ips := make(map[string]bool)
+	for _, endpoints := range endpointSlice.Endpoints {
+		for _, addr := range endpoints.Addresses {
+			ips[addr] = true
+		}
+	}
+	return ips
+}
+
+func (cont *AciController) endpointSliceAdded(obj interface{}) {
+	endpointslice := obj.(*v1beta1.EndpointSlice)
+	servicekey := getServiceKey(endpointslice)
+	ips := cont.getEndpointSliceIps(endpointslice)
+	cont.indexMutex.Lock()
+	cont.updateIpIndex(cont.endpointsIpIndex, nil, ips, servicekey)
+	cont.queueIPNetPolUpdates(ips)
+	cont.indexMutex.Unlock()
+
+	cont.queueEndpointSliceNetPolUpdates(endpointslice)
+
+	cont.queueServiceUpdateByKey(servicekey)
+	cont.log.Info("EndPointSlice Object Added: ", servicekey)
+}
+
+func (cont *AciController) endpointSliceDeleted(obj interface{}) {
+	endpointslice := obj.(*v1beta1.EndpointSlice)
+	servicekey := getServiceKey(endpointslice)
+	ips := cont.getEndpointSliceIps(endpointslice)
+	cont.indexMutex.Lock()
+	cont.updateIpIndex(cont.endpointsIpIndex, ips, nil, servicekey)
+	cont.queueIPNetPolUpdates(ips)
+	cont.indexMutex.Unlock()
+	cont.queueEndpointSliceNetPolUpdates(endpointslice)
+	cont.queueServiceUpdateByKey(servicekey)
+}
+
+func (cont *AciController) endpointSliceUpdated(old interface{}, new interface{}) {
+	oldendpointslice := old.(*v1beta1.EndpointSlice)
+	newendpointslice := new.(*v1beta1.EndpointSlice)
+	servicekey := getServiceKey(newendpointslice)
+	oldIps := cont.getEndpointSliceIps(oldendpointslice)
+	newIps := cont.getEndpointSliceIps(newendpointslice)
+	if !reflect.DeepEqual(oldIps, newIps) {
+		cont.indexMutex.Lock()
+		cont.queueIPNetPolUpdates(oldIps)
+		cont.updateIpIndex(cont.endpointsIpIndex, oldIps, newIps, servicekey)
+		cont.queueIPNetPolUpdates(newIps)
+		cont.indexMutex.Unlock()
+	}
+
+	if !reflect.DeepEqual(oldendpointslice.Endpoints, newendpointslice.Endpoints) {
+		cont.queueEndpointSliceNetPolUpdates(oldendpointslice)
+		cont.queueEndpointSliceNetPolUpdates(newendpointslice)
+	}
+	cont.log.Debug("EndPointSlice Object Update: ", servicekey)
+	cont.queueServiceUpdateByKey(servicekey)
+
+}
+
+func (cont *AciController) queueEndpointSliceNetPolUpdates(endpointslice *v1beta1.EndpointSlice) {
+	for _, endpoints := range endpointslice.Endpoints {
+		if endpoints.TargetRef == nil || endpoints.TargetRef.Kind != "Pod" ||
+			endpoints.TargetRef.Namespace == "" || endpoints.TargetRef.Name == "" {
+			continue
+		}
+		podkey := endpoints.TargetRef.Namespace + "/" + endpoints.TargetRef.Name
+		npkeys := cont.netPolEgressPods.GetObjForPod(podkey)
+		for _, npkey := range npkeys {
+			cont.queueNetPolUpdateByKey(npkey)
+		}
+	}
+}
+
+func getServiceKey(endPointSlice *v1beta1.EndpointSlice) string {
+	return endPointSlice.ObjectMeta.Namespace + "/" +
+		endPointSlice.ObjectMeta.GetLabels()[v1beta1.LabelServiceName]
 }

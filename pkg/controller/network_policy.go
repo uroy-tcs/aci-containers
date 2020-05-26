@@ -40,6 +40,7 @@ import (
 	"github.com/noironetworks/aci-containers/pkg/index"
 	"github.com/noironetworks/aci-containers/pkg/ipam"
 	"github.com/noironetworks/aci-containers/pkg/util"
+	v1beta "k8s.io/api/discovery/v1beta1"
 )
 
 func (cont *AciController) initNetworkPolicyInformerFromClient(
@@ -693,6 +694,21 @@ func checkEndpoints(subnetIndex cidranger.Ranger,
 
 	return true
 }
+func checkEndpointslices(subnetIndex cidranger.Ranger,
+	addresses []string) bool {
+
+	for _, addr := range addresses {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			return false
+		}
+		contains, err := subnetIndex.Contains(ip)
+		if err != nil || !contains {
+			return false
+		}
+	}
+	return true
+}
 
 type portRemoteSubnet struct {
 	port           *v1net.NetworkPolicyPort
@@ -802,62 +818,116 @@ func (cont *AciController) getServiceAugmentBySubnet(subj apicapi.ApicObject,
 				servicekey+": ", err.Error())
 			continue
 		}
-		endpointsobj, _, err := cont.endpointsIndexer.GetByKey(servicekey)
-		if err != nil {
-			logger.Error("Could not lookup endpoints for "+
-				servicekey+": ", err.Error())
-			continue
-		}
-		if serviceobj == nil || endpointsobj == nil {
+		if serviceobj == nil {
 			continue
 		}
 		service := serviceobj.(*v1.Service)
-		endpoints := endpointsobj.(*v1.Endpoints)
-
-		for _, svcPort := range service.Spec.Ports {
-			if prs.port != nil &&
-				(svcPort.Protocol != *prs.port.Protocol ||
-					svcPort.TargetPort.String() !=
-						prs.port.Port.String()) {
-				// egress rule does not match service target port
+		if !cont.endPointSliceEnabled {
+			endpointsobj, _, err := cont.endpointsIndexer.GetByKey(servicekey)
+			if err != nil {
+				logger.Error("Could not lookup endpoints for "+
+					servicekey+": ", err.Error())
 				continue
 			}
-			for _, subset := range endpoints.Subsets {
-				var foundEpPort *v1.EndpointPort
-
-				for _, endpointPort := range subset.Ports {
-					if endpointPort.Name == svcPort.Name ||
-						(len(service.Spec.Ports) == 1 &&
-							endpointPort.Name == "") {
-						foundEpPort = &endpointPort
-						break
-					}
-				}
-				if foundEpPort == nil {
-					continue
-				}
-
-				incomplete := false
-				incomplete = incomplete ||
-					!checkEndpoints(subnetIndex, subset.Addresses)
-				incomplete = incomplete || !checkEndpoints(subnetIndex,
-					subset.NotReadyAddresses)
-
-				if incomplete {
-					continue
-				}
-
-				proto := portProto(&foundEpPort.Protocol)
-				port := strconv.Itoa(int(svcPort.Port))
-				updateServiceAugmentForService(portAugments,
-					proto, port, service)
-
-				logger.WithFields(logrus.Fields{
-					"proto":   proto,
-					"port":    port,
-					"service": servicekey,
-				}).Debug("Allowing egress for service by subnet match")
+			if endpointsobj == nil {
+				continue
 			}
+			endpoints := endpointsobj.(*v1.Endpoints)
+
+			for _, svcPort := range service.Spec.Ports {
+				if prs.port != nil &&
+					(svcPort.Protocol != *prs.port.Protocol ||
+						svcPort.TargetPort.String() !=
+							prs.port.Port.String()) {
+					// egress rule does not match service target port
+					continue
+				}
+				for _, subset := range endpoints.Subsets {
+					var foundEpPort *v1.EndpointPort
+
+					for _, endpointPort := range subset.Ports {
+						if endpointPort.Name == svcPort.Name ||
+							(len(service.Spec.Ports) == 1 &&
+								endpointPort.Name == "") {
+							foundEpPort = &endpointPort
+							break
+						}
+					}
+					if foundEpPort == nil {
+						continue
+					}
+
+					incomplete := false
+					incomplete = incomplete ||
+						!checkEndpoints(subnetIndex, subset.Addresses)
+					incomplete = incomplete || !checkEndpoints(subnetIndex,
+						subset.NotReadyAddresses)
+
+					if incomplete {
+						continue
+					}
+
+					proto := portProto(&foundEpPort.Protocol)
+					port := strconv.Itoa(int(svcPort.Port))
+					updateServiceAugmentForService(portAugments,
+						proto, port, service)
+
+					logger.WithFields(logrus.Fields{
+						"proto":   proto,
+						"port":    port,
+						"service": servicekey,
+					}).Debug("Allowing egress for service by subnet match")
+				}
+			}
+		} else {
+			label := map[string]string{"kubernetes.io/service-name": service.ObjectMeta.Name}
+			selector := labels.SelectorFromSet(labels.Set(label))
+			cache.ListAllByNamespace(cont.endpointSliceIndexer, service.ObjectMeta.Namespace, selector,
+				func(endpointSliceobj interface{}) {
+					endpointSlices := endpointSliceobj.(*v1beta.EndpointSlice)
+					for _, svcPort := range service.Spec.Ports {
+						if prs.port != nil &&
+							(svcPort.Protocol != *prs.port.Protocol ||
+								svcPort.TargetPort.String() !=
+									prs.port.Port.String()) {
+							// egress rule does not match service target port
+							continue
+						}
+						var foundEpPort *v1beta.EndpointPort
+						for _, endpointPort := range endpointSlices.Ports {
+
+							if *endpointPort.Name == svcPort.Name ||
+								(len(service.Spec.Ports) == 1 &&
+									*endpointPort.Name == "") {
+								foundEpPort = &endpointPort
+								cont.log.Debug("Found EpPort: ", foundEpPort)
+								break
+							}
+						}
+						if foundEpPort == nil {
+							return
+						}
+						// @TODO need to revisit this code to check for non ready address
+						incomplete := false
+						for _, endpoint := range endpointSlices.Endpoints {
+							incomplete = incomplete || !checkEndpointslices(subnetIndex, endpoint.Addresses)
+						}
+						if incomplete {
+							continue
+						}
+						proto := portProto(foundEpPort.Protocol)
+						port := strconv.Itoa(int(svcPort.Port))
+						cont.log.Debug("updateServiceAugmentForService: ", service)
+						updateServiceAugmentForService(portAugments,
+							proto, port, service)
+
+						logger.WithFields(logrus.Fields{
+							"proto":   proto,
+							"port":    port,
+							"service": servicekey,
+						}).Debug("Allowing egress for service by subnet match")
+					}
+				})
 		}
 	}
 }
