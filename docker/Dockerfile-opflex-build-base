@@ -42,11 +42,10 @@ RUN wget https://github.com/Tencent/rapidjson/archive/v1.1.0.tar.gz \
   && cd grpc \
   && git checkout 5052efd666ab6fdda2a4b3045569f70ce0c5fa57 \
   && git submodule update --init \
-  && cmake -DBUILD_SHARED_LIBS=ON -DgRPC_BUILD_GRPC_CSHARP_PLUGIN=OFF -DgRPC_BUILD_GRPC_NODE_PLUGIN=OFF -DgRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN=OFF -DgRPC_BUILD_GRPC_PHP_PLUGIN=OFF -DgRPC_BUILD_GRPC_PYTHON_PLUGIN=OFF -DgRPC_BUILD_GRPC_RUBY_PLUGIN=OFF . \
   && make $make_args && make install \
   && cd third_party/protobuf \
   && ./autogen.sh \
-  && ./configure \
+  && ./configure DIST_LANG=cpp \
   && make $make_args && make install && make clean \
   && cd / \
   && rm -rf grpc
